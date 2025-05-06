@@ -52,3 +52,16 @@ if __name__ == '__main__':
     print('[Forward]\n O error:', error(our_O, torch_O))
     print('[Backward]\n X grad error:', error(our_X_grad, torch_X_grad), '\n W grad error:', error(our_W_grad, torch_W_grad))
     print('[Backward]\n bias grad error:', error(splinear.bias.grad, linear.bias.grad))
+
+    our_X_jit = X_orig.clone()
+    our_X_jit.retain_grad()
+    our_Y_jit = Y_orig.clone()
+    splinear_jit = SparseLinear(W, bias=torch.nn.Parameter(deepcopy(bias)), jit_fn=True)
+    our_O_jit = splinear_jit(our_X_jit)
+    torch.mean((our_O_jit - our_Y_jit) ** 2).backward()
+    our_X_grad_jit = our_X_jit.grad
+    our_W_grad_jit = splinear_jit.W_val.grad
+
+    print('\n[Forward JIT]\n O error:', error(our_O_jit, torch_O))
+    print('[Backward  JIT]\n X grad error:', error(our_X_grad_jit, torch_X_grad), '\n W grad error:', error(our_W_grad_jit, torch_W_grad))
+    print('[Backward JIT]\n bias grad error:', error(splinear_jit.bias.grad, linear.bias.grad))

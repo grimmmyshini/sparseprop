@@ -29,13 +29,14 @@ if __name__ == '__main__':
     N = 256
     B = 128
     sparsities = [.8, .9, .95, .98, .99]
-    reps = 3
+    reps = 50
 
     torch.manual_seed(11)
     tag = sys.argv[1] if len(sys.argv) > 1 else None
 
-    module_fns = [DenseLinear, SparseLinear, SparseLinearTorch]
-    module_names = [m.__name__ for m in module_fns]
+    module_fns = [DenseLinear, SparseLinear, SparseLinear, SparseLinearTorch]
+    module_init = [[], [None, True], [], []]
+    module_names = [m.__name__ + ('jit' if len(module_init[i]) else '') for i, m in enumerate(module_fns)]
 
     forward_times = {m: [] for m in module_names}
     backward_times = {m: [] for m in module_names}
@@ -54,9 +55,9 @@ if __name__ == '__main__':
             X_orig.requires_grad_()
             X_orig.retain_grad()
 
-            for module_name, module_fn in zip(module_names, module_fns):
+            for module_name, module_fn, module_args in zip(module_names, module_fns, module_init):
                 
-                module = module_fn(W)
+                module = module_fn(W, *module_args)
                 X = X_orig.clone()
                 Y = Y_orig.clone()
 
@@ -67,7 +68,7 @@ if __name__ == '__main__':
         for mn in module_names:
             forward_times[mn].append(sum(sp_forward_times[mn]) / reps)
             backward_times[mn].append(sum(sp_backward_times[mn]) / reps)
-
+    print(forward_times)
     title = f'B{B}-M{M}-N{N}'
     if tag is not None:
         title += '-' + tag

@@ -5,7 +5,7 @@ from sparseprop.modules.functions import SparseLinearFunction
 from sparseprop.modules.utils import to_csr_2d, from_csr_2d
 
 class SparseLinear(torch.nn.Module):
-    def __init__(self, dense_weight, bias=None):
+    def __init__(self, dense_weight, bias=None, jit_fn = False):
         super(SparseLinear, self).__init__()
         self.N, self.M = dense_weight.shape
 
@@ -13,8 +13,11 @@ class SparseLinear(torch.nn.Module):
         self.W_val = torch.nn.Parameter(W_val)
         self.W_idx = W_idx
 
+        self.sparse_linear_fn = SparseLinearFunction()
         assert bias is None or isinstance(bias, torch.nn.Parameter), f"bias is not a parameter but it's {type(bias)}"
         self.bias = bias
+
+        self.jit_fn = jit_fn
     
     @staticmethod
     def from_dense(module):
@@ -51,7 +54,7 @@ class SparseLinear(torch.nn.Module):
         return self.W_val
     
     def forward(self, input):
-        return SparseLinearFunction.apply(input, self.W_val, self.W_idx, self.bias, self.N)
+        return self.sparse_linear_fn.apply(input, self.W_val, self.W_idx, self.bias, self.N, self.jit_fn)
 
     @torch.no_grad()
     def apply_further_mask(self, new_mask):
