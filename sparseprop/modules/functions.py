@@ -2,17 +2,14 @@ import ctypes
 import torch
 import math
 
-from sparseprop.modules.linear_jit import LinearJIT
 from sparseprop import backend as sppb
 
 TRANSPOSE_BLOCK_SIZE = 16
 
 
 class SparseLinearFunction(torch.autograd.Function):
-    _jit_fns = None
-
     @staticmethod
-    def forward(ctx, inputT, W_val, W_idx, bias, N, use_jit=False):
+    def forward(ctx, inputT, W_val, W_idx, bias, N, jit=None):
         input_flat_t = inputT.reshape(-1, inputT.shape[-1])
         B, M = input_flat_t.shape
         if B % TRANSPOSE_BLOCK_SIZE == 0 and M % TRANSPOSE_BLOCK_SIZE == 0:
@@ -28,15 +25,12 @@ class SparseLinearFunction(torch.autograd.Function):
 
         output = torch.zeros(N, B).float()
 
-        if not use_jit:
+        if not jit:
             sppb.sparse_linear_vectorized_forward(
                 input_flat, W_idx_N, W_idx_M, W_val, output
             )
         else:
-            if not SparseLinearFunction._jit_fns:
-                SparseLinearFunction._jit_fns = LinearJIT()
-
-            SparseLinearFunction._jit_fns.call_forward(
+            jit.call_forward(
                 B,
                 M,
                 N,
@@ -48,9 +42,9 @@ class SparseLinearFunction(torch.autograd.Function):
                 output.data_ptr(),
             )
 
+        ctx.jit = jit
         ctx.save_for_backward(W_val, bias)
         ctx.svd = (input_flat, W_idx_N, W_idx_M)
-        ctx.use_jit = use_jit
 
         if bias is not None:
             output += bias.view(-1, 1)
@@ -79,12 +73,12 @@ class SparseLinearFunction(torch.autograd.Function):
         grad_input = torch.zeros_like(input_flat).float().contiguous()  # (M, B)
         grad_W_val = torch.zeros_like(W_val).float().contiguous()
 
-        if not ctx.use_jit:
+        if not ctx.jit:
             sppb.sparse_linear_vectorized_backward(
                 input_flat, W_idx_N, W_idx_M, W_val, grad_output, grad_input, grad_W_val
             )
         else:
-            SparseLinearFunction._jit_fns.call_backward(
+            ctx.jit.call_backward(
                 B,
                 input_flat.shape[0],
                 N,

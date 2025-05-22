@@ -3,9 +3,10 @@ from scipy.sparse import csr_matrix
 
 from sparseprop.modules.functions import SparseLinearFunction
 from sparseprop.modules.utils import to_csr_2d, from_csr_2d
+from sparseprop.modules.linear_jit import LinearJIT, JITOptions
 
 class SparseLinear(torch.nn.Module):
-    def __init__(self, dense_weight, bias=None, jit_fn = False):
+    def __init__(self, dense_weight, bias=None, jit_fn = False, jit_ops = JITOptions()):
         super(SparseLinear, self).__init__()
         self.N, self.M = dense_weight.shape
 
@@ -17,8 +18,9 @@ class SparseLinear(torch.nn.Module):
         assert bias is None or isinstance(bias, torch.nn.Parameter), f"bias is not a parameter but it's {type(bias)}"
         self.bias = bias
 
-        self.jit_fn = jit_fn
-    
+        self.jit_ops = jit_ops 
+        self.jit = LinearJIT(jit_ops) if jit_fn else None
+
     @staticmethod
     def from_dense(module):
         return SparseLinear(
@@ -54,7 +56,9 @@ class SparseLinear(torch.nn.Module):
         return self.W_val
     
     def forward(self, input):
-        return self.sparse_linear_fn.apply(input, self.W_val, self.W_idx, self.bias, self.N, self.jit_fn)
+        if self.jit and self.jit_ops.unroll:
+            self.jit.add_unrolling(input.reshape(-1, input.shape[-1]).shape[0])
+        return self.sparse_linear_fn.apply(input, self.W_val, self.W_idx, self.bias, self.N, self.jit)
 
     @torch.no_grad()
     def apply_further_mask(self, new_mask):

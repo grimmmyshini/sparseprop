@@ -1,10 +1,17 @@
+from concurrent.futures import ThreadPoolExecutor, wait
 import ctypes
-
 from llvmlite import ir, binding
 
+from sparseprop.modules.jit_utils import JITOptions
 
 class LinearJIT:
-    def __init__(self, name="jit_sparse_linear_forward"):
+    def __init__(self, jit_options=JITOptions(), name="jit_sparse_linear_forward"):
+        self.options = jit_options
+        self.unroll_times = jit_options.batch_size // 8
+
+        self.fn_fwd = None
+        self.fn_bwd = None
+
         # Initialize LLVM
         binding.initialize()
         binding.initialize_native_target()
@@ -13,13 +20,13 @@ class LinearJIT:
         self.opt_level = 3
 
         target = binding.Target.from_default_triple()
-        target_machine = target.create_target_machine(
+        self.target_machine = target.create_target_machine(
             cpu=binding.get_host_cpu_name(),
             features=binding.get_host_cpu_features().flatten(),
             opt=self.opt_level,
         )
         backing_mod = binding.parse_assembly("")
-        self.engine = binding.create_mcjit_compiler(backing_mod, target_machine)
+        self.engine = binding.create_mcjit_compiler(backing_mod, self.target_machine)
 
         # Common util functions
         self.fma_intr = ir.Function(
@@ -45,13 +52,24 @@ class LinearJIT:
         # global_fmt.initializer = ir.Constant(fmt_type, fmt_bytes)
         ############# Printf
 
-        self._jit_forward()
-        self._jit_backward()
+    def add_unrolling(self, B):
+        # This is a bit tricky because ideally we want to re-jit as less as possible
+        # However, if unrolling is added and the batch size changes, then we HAVE to re-jit.
+        assert self.options.batch_size == B or not (self.fn_fwd and self.fn_bwd), (
+            "Changing batchsize after a function has been jit-ted is not yet supported!"
+        )
+
+        self.options.batch_size = B
+        self.options.unroll = True
+        self.unroll_times = B // 8
 
     @staticmethod
-    def vec_load_arr(builder, arr, idx, name):
+    def vec_load_arr(builder, arr, idx, name=None):
         vec_float_ty = ir.VectorType(ir.FloatType(), 8)
-        vec = builder.alloca(vec_float_ty, name=name)
+        if name is not None:
+            vec = builder.alloca(vec_float_ty, name=name)
+        else:
+            vec = builder.alloca(vec_float_ty)
         builder.store(
             builder.load(
                 builder.bitcast(builder.gep(arr, [idx]), ir.PointerType(vec_float_ty))
@@ -60,8 +78,69 @@ class LinearJIT:
         )
         return vec
 
+    @staticmethod
+    def optimize(module, target_machine):
+        pb = binding.PassBuilder(
+            target_machine, binding.PipelineTuningOptions(speed_level=3, size_level=0)
+        )
+        pm = pb.getModulePassManager()
+        pm.run(module, pb)
+
+    def fwd_fma(self, builder, X, X_idx, O, O_idx, v):
+        # __m256 x = _mm256_loadu_ps(X + (idx * B + j));
+        x = LinearJIT.vec_load_arr(builder, X, X_idx)
+        # __m256 o = _mm256_loadu_ps(O + (i * B + j));
+        o = LinearJIT.vec_load_arr(builder, O, O_idx)
+        # __m256 r = _mm256_fmadd_ps(x,v,o);
+        r = builder.alloca(ir.VectorType(ir.FloatType(), 8))
+        fma = builder.call(
+            self.fma_intr,
+            [builder.load(x), builder.load(v), builder.load(o)],
+        )
+        builder.store(fma, r)
+        # _mm256_storeu_ps(O + (i * B + j), r);
+        builder.store(
+            builder.load(r),
+            builder.bitcast(
+                builder.gep(O, [O_idx]),
+                ir.PointerType(ir.VectorType(ir.FloatType(), 8)),
+            ),
+        )
+
+    def fwd_block_loop(self, builder, B, idx, i_val, X, O, v):
+        if self.options.unroll and self.options.batch_size:
+            for i in range(self.unroll_times):
+                j = ir.Constant(ir.IntType(32), i * 8)
+                X_idx = builder.add(builder.mul(builder.load(idx), B), j)
+                O_idx = builder.add(builder.mul(i_val, B), j)
+                self.fwd_fma(builder, X, X_idx, O, O_idx, v)
+        else:
+            # int j = 0;
+            j = builder.alloca(ir.IntType(32))
+            builder.store(ir.Constant(ir.IntType(32), 0), j)
+
+            # for(; j < B-7; j+=8){
+            block_loop = builder.append_basic_block("block_loop")
+            builder.branch(block_loop)
+            builder.position_at_start(block_loop)
+            j_val = builder.load(j)
+            cond3 = builder.icmp_signed(
+                "<", j_val, builder.sub(B, ir.Constant(ir.IntType(32), 7))
+            )
+            with builder.if_then(cond3):
+                # __m256 x = _mm256_loadu_ps(X + (idx * B + j));
+                # __m256 o = _mm256_loadu_ps(O + (i * B + j));
+                # __m256 r = _mm256_fmadd_ps(x,v,o);
+                # _mm256_storeu_ps(O + (i * B + j), r);
+                X_idx = builder.add(builder.mul(builder.load(idx), B), j_val)
+                O_idx = builder.add(builder.mul(i_val, B), j_val)
+                self.fwd_fma(builder, X, X_idx, O, O_idx, v)
+
+                builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 8)), j)
+                builder.branch(block_loop)
+
     def _jit_forward(self, fn_name="sparse_fwd"):
-        # void fn(int B, int M, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M, float* W_val, float* O)
+        # void fn(int B, int M, int N_start, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M, float* W_val, float* O)
         float_ptr_ty = ir.PointerType(ir.FloatType())
         int_ptr_ty = ir.PointerType(ir.IntType(32))
         int_ty = ir.IntType(32)
@@ -69,6 +148,7 @@ class LinearJIT:
         func_ty = ir.FunctionType(
             ir.VoidType(),
             [
+                int_ty,
                 int_ty,
                 int_ty,
                 int_ty,
@@ -82,14 +162,14 @@ class LinearJIT:
         )
 
         func = ir.Function(self.module, func_ty, name=fn_name)
-        B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O = func.args
+        B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O = func.args
 
         block = func.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
 
         # for(int i = 0; i < N; i++){
         i = builder.alloca(int_ty, name="i")
-        builder.store(ir.Constant(int_ty, 0), i)
+        builder.store(N_start, i)
 
         outer_loop = builder.append_basic_block("outer_loop")
         builder.branch(outer_loop)
@@ -133,47 +213,7 @@ class LinearJIT:
                 )
                 builder.store(v_set, v)
 
-                # int j = 0;
-                j = builder.alloca(int_ty)
-                builder.store(ir.Constant(int_ty, 0), j)
-
-                # for(; j < B-7; j+=8){
-                block_loop = builder.append_basic_block("block_loop")
-                builder.branch(block_loop)
-                builder.position_at_start(block_loop)
-
-                j_val = builder.load(j)
-                cond3 = builder.icmp_signed(
-                    "<", j_val, builder.sub(B, ir.Constant(int_ty, 7))
-                )
-
-                with builder.if_then(cond3):
-                    # __m256 x = _mm256_loadu_ps(X + (idx * B + j));
-                    X_idx = builder.add(builder.mul(builder.load(idx), B), j_val)
-                    x = LinearJIT.vec_load_arr(builder, X, X_idx, "x")
-
-                    # __m256 o = _mm256_loadu_ps(O + (i * B + j));
-                    O_idx = builder.add(builder.mul(i_val, B), j_val)
-                    o = LinearJIT.vec_load_arr(builder, O, O_idx, "output")
-
-                    # __m256 r = _mm256_fmadd_ps(x,v,o);
-                    r = builder.alloca(vec_float_ty, name="r")
-                    fma = builder.call(
-                        self.fma_intr,
-                        [builder.load(x), builder.load(v), builder.load(o)],
-                    )
-                    builder.store(fma, r)
-
-                    # _mm256_storeu_ps(O + (i * B + j), r);
-                    builder.store(
-                        builder.load(r),
-                        builder.bitcast(
-                            builder.gep(O, [O_idx]), ir.PointerType(vec_float_ty)
-                        ),
-                    )
-
-                    builder.store(builder.add(j_val, ir.Constant(int_ty, 8)), j)
-                    builder.branch(block_loop)
+                self.fwd_block_loop(builder, B, idx, i_val, X, O, v)
 
                 builder.store(builder.add(k_val, ir.Constant(int_ty, 1)), k)
                 builder.branch(inner_loop)
@@ -184,13 +224,8 @@ class LinearJIT:
 
         llvm_ir = str(self.module)
         mod = binding.parse_assembly(llvm_ir)
-        mod.verify()
 
-        pm = binding.create_module_pass_manager()
-        pmb = binding.PassManagerBuilder()
-        pmb.opt_level = self.opt_level
-        pmb.populate(pm)
-        pm.run(mod)
+        LinearJIT.optimize(mod, self.target_machine)
 
         self.engine.add_module(mod)
         self.engine.finalize_object()
@@ -203,6 +238,7 @@ class LinearJIT:
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
+            ctypes.c_int,
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int),
@@ -211,6 +247,73 @@ class LinearJIT:
         )(fn_ptr)
 
         ctypes.CDLL(None)
+
+    def bck_fma(self, builder, dLdX, x_idx, X, dLdO, O_idx, v, acc):
+        # __m256 dx0 = _mm256_loadu_ps(dLdX + (r * B + k));
+        dx0 = LinearJIT.vec_load_arr(builder, dLdX, x_idx)
+
+        # __m256 x0 = _mm256_loadu_ps(X + (r * B + k));
+        x0 = LinearJIT.vec_load_arr(builder, X, x_idx)
+
+        # __m256 do0 = _mm256_loadu_ps(dLdO + (i * B + k));
+        do0 = LinearJIT.vec_load_arr(builder, dLdO, O_idx)
+
+        # __m256 s0 = _mm256_fmadd_ps(v, do0, dx0);
+        s0 = builder.alloca(ir.VectorType(ir.FloatType(), 8))
+        fma = builder.call(
+            self.fma_intr,
+            [builder.load(v), builder.load(do0), builder.load(dx0)],
+        )
+        builder.store(fma, s0)
+
+        # acc = _mm256_fmadd_ps(do0,x0,acc);
+        fma2 = builder.call(
+            self.fma_intr,
+            [builder.load(do0), builder.load(x0), builder.load(acc)],
+        )
+        builder.store(fma2, acc)
+
+        # _mm256_storeu_ps(dLdX + (r * B + k), s0);
+        builder.store(
+            builder.load(s0),
+            builder.bitcast(
+                builder.gep(dLdX, [x_idx]),
+                ir.PointerType(ir.VectorType(ir.FloatType(), 8)),
+            ),
+        )
+
+    def bck_block_loop(self, builder, B, r, i_val, dLdX, X, dLdO, v, acc):
+        if self.options.unroll and self.options.batch_size:
+            for i in range(self.unroll_times):
+                k = ir.Constant(ir.IntType(32), i * 8)
+                x_idx = builder.add(builder.mul(builder.load(r), B), k)
+                O_idx = builder.add(builder.mul(i_val, B), k)
+                self.bck_fma(builder, dLdX, x_idx, X, dLdO, O_idx, v, acc)
+        else:
+            # int k = 0;
+            k = builder.alloca(ir.IntType(32))
+            builder.store(ir.Constant(ir.IntType(32), 0), k)
+
+            # for(; k < B-7; k+=8){
+            block_loop = builder.append_basic_block("block_loop")
+            builder.branch(block_loop)
+            builder.position_at_start(block_loop)
+
+            k_val = builder.load(k)
+            cond3 = builder.icmp_signed(
+                "<", k_val, builder.sub(B, ir.Constant(ir.IntType(32), 7))
+            )
+
+            with builder.if_then(cond3):
+                # __m256 dx0 = _mm256_loadu_ps(dLdX + (r * B + k));
+                # __m256 x0 = _mm256_loadu_ps(X + (r * B + k));
+                # __m256 do0 = _mm256_loadu_ps(dLdO + (i * B + k));
+                x_idx = builder.add(builder.mul(builder.load(r), B), k_val)
+                O_idx = builder.add(builder.mul(i_val, B), k_val)
+                self.bck_fma(builder, dLdX, x_idx, X, dLdO, O_idx, v, acc)
+
+                builder.store(builder.add(k_val, ir.Constant(ir.IntType(32), 8)), k)
+                builder.branch(block_loop)
 
     def _jit_backward(self, fn_name="sparse_bwd"):
         # void fn(int B, int M, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M,float* W_val, float* dLdO, float* dLdX, float* dLdW_val)
@@ -226,6 +329,7 @@ class LinearJIT:
                 int_ty,
                 int_ty,
                 int_ty,
+                int_ty,
                 float_ptr_ty,
                 int_ptr_ty,
                 int_ptr_ty,
@@ -237,14 +341,16 @@ class LinearJIT:
         )
 
         func = ir.Function(self.module, func_ty, name=fn_name)
-        B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, dLdO, dLdX, dLdW_val = func.args
+        B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, dLdO, dLdX, dLdW_val = (
+            func.args
+        )
 
         block = func.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
 
         # for(int i = 0; i < N; i++){
         i = builder.alloca(int_ty, name="i")
-        builder.store(ir.Constant(int_ty, 0), i)
+        builder.store(N_start, i)
 
         outer_loop = builder.append_basic_block("outer_loop")
         builder.branch(outer_loop)
@@ -295,57 +401,7 @@ class LinearJIT:
                 acc = builder.alloca(vec_float_ty, name="acc")
                 builder.store(ir.Constant(vec_float_ty, 0), acc)
 
-                # int k = 0;
-                k = builder.alloca(int_ty)
-                builder.store(ir.Constant(int_ty, 0), k)
-
-                # for(; k < B-7; k+=8){
-                block_loop = builder.append_basic_block("block_loop")
-                builder.branch(block_loop)
-                builder.position_at_start(block_loop)
-
-                k_val = builder.load(k)
-                cond3 = builder.icmp_signed(
-                    "<", k_val, builder.sub(B, ir.Constant(int_ty, 7))
-                )
-
-                with builder.if_then(cond3):
-                    # __m256 dx0 = _mm256_loadu_ps(dLdX + (r * B + k));
-                    x_idx = builder.add(builder.mul(builder.load(r), B), k_val)
-                    dx0 = LinearJIT.vec_load_arr(builder, dLdX, x_idx, "dx0")
-
-                    # __m256 x0 = _mm256_loadu_ps(X + (r * B + k));
-                    x0 = LinearJIT.vec_load_arr(builder, X, x_idx, "x0")
-
-                    # __m256 do0 = _mm256_loadu_ps(dLdO + (i * B + k));
-                    O_idx = builder.add(builder.mul(i_val, B), k_val)
-                    do0 = LinearJIT.vec_load_arr(builder, dLdO, O_idx, "do0")
-
-                    # __m256 s0 = _mm256_fmadd_ps(v, do0, dx0);
-                    s0 = builder.alloca(vec_float_ty, name="s0")
-                    fma = builder.call(
-                        self.fma_intr,
-                        [builder.load(v), builder.load(do0), builder.load(dx0)],
-                    )
-                    builder.store(fma, s0)
-
-                    # acc = _mm256_fmadd_ps(do0,x0,acc);
-                    fma2 = builder.call(
-                        self.fma_intr,
-                        [builder.load(do0), builder.load(x0), builder.load(acc)],
-                    )
-                    builder.store(fma2, acc)
-
-                    # _mm256_storeu_ps(dLdX + (r * B + k), s0);
-                    builder.store(
-                        builder.load(s0),
-                        builder.bitcast(
-                            builder.gep(dLdX, [x_idx]), ir.PointerType(vec_float_ty)
-                        ),
-                    )
-
-                    builder.store(builder.add(k_val, ir.Constant(int_ty, 8)), k)
-                    builder.branch(block_loop)
+                self.bck_block_loop(builder, B, r, i_val, dLdX, X, dLdO, v, acc)
 
                 # const __m128 hiQuad0 = _mm256_extractf128_ps(acc, 1);
                 # shufflevector <8 x float> %89, <4 x i32> <i32 4, i32 5, i32 6, i32 7>
@@ -436,13 +492,8 @@ class LinearJIT:
 
         llvm_ir = str(self.module)
         mod = binding.parse_assembly(llvm_ir)
-        mod.verify()
 
-        pm = binding.create_module_pass_manager()
-        pmb = binding.PassManagerBuilder()
-        pmb.opt_level = self.opt_level
-        pmb.populate(pm)
-        pm.run(mod)
+        LinearJIT.optimize(mod, self.target_machine)
 
         self.engine.add_module(mod)
         self.engine.finalize_object()
@@ -451,6 +502,7 @@ class LinearJIT:
 
         self.fn_bwd = ctypes.CFUNCTYPE(
             None,
+            ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
@@ -466,32 +518,75 @@ class LinearJIT:
 
         ctypes.CDLL(None)
 
-    def call_forward(self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output):
-        self.fn_fwd(
-            B,
-            M,
-            N,
-            W_nnz,
-            ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
-            ctypes.cast(W_idx_M, ctypes.POINTER(ctypes.c_int)),
-            ctypes.cast(W_val, ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(output, ctypes.POINTER(ctypes.c_float)),
-        )
+    def _call(self, worker, N, num_threads):
+        if self.options.parallel:
+            chunk_size = (N + num_threads - 1) // num_threads
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = []
+                for i in range(num_threads):
+                    futures.append(
+                        executor.submit(
+                            worker, i * chunk_size, min((i + 1) * chunk_size, N)
+                        )
+                    )
+                wait(futures)
+        else:
+            worker(0, N)
+
+    def call_forward(
+        self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output, num_threads=4
+    ):
+        def worker(n_start, n_end):
+            self.fn_fwd(
+                B,
+                M,
+                n_start,
+                n_end,
+                W_nnz,
+                ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
+                ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
+                ctypes.cast(W_idx_M, ctypes.POINTER(ctypes.c_int)),
+                ctypes.cast(W_val, ctypes.POINTER(ctypes.c_float)),
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_float)),
+            )
+
+        if not self.fn_fwd:
+            self._jit_forward()
+
+        self._call(worker, N, num_threads)
 
     def call_backward(
-        self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, dLdO, dLdX, dLdW_val
+        self,
+        B,
+        M,
+        N,
+        W_nnz,
+        X,
+        W_idx_N,
+        W_idx_M,
+        W_val,
+        dLdO,
+        dLdX,
+        dLdW_val,
+        num_threads=4,
     ):
-        self.fn_bwd(
-            B,
-            M,
-            N,
-            W_nnz,
-            ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
-            ctypes.cast(W_idx_M, ctypes.POINTER(ctypes.c_int)),
-            ctypes.cast(W_val, ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(dLdO, ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(dLdX, ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(dLdW_val, ctypes.POINTER(ctypes.c_float)),
-        )
+        def worker(n_start, n_end):
+            self.fn_bwd(
+                B,
+                M,
+                n_start,
+                n_end,
+                W_nnz,
+                ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
+                ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
+                ctypes.cast(W_idx_M, ctypes.POINTER(ctypes.c_int)),
+                ctypes.cast(W_val, ctypes.POINTER(ctypes.c_float)),
+                ctypes.cast(dLdO, ctypes.POINTER(ctypes.c_float)),
+                ctypes.cast(dLdX, ctypes.POINTER(ctypes.c_float)),
+                ctypes.cast(dLdW_val, ctypes.POINTER(ctypes.c_float)),
+            )
+
+        if not self.fn_bwd:
+            self._jit_backward()
+
+        self._call(worker, N, num_threads)
