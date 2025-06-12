@@ -1,0 +1,5 @@
+plots/*
+build/*
+*.so
+*.egg*
+*__pycache__*
