@@ -19,7 +19,7 @@ class SparseLinear(torch.nn.Module):
         self.bias = bias
 
         self.jit_ops = jit_ops 
-        self.jit = LinearJIT(jit_ops) if jit_fn else None
+        self.jit = LinearJIT(W_val, W_idx, dense_weight.shape, jit_ops) if jit_fn else None
 
     @staticmethod
     def from_dense(module):

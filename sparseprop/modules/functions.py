@@ -30,12 +30,15 @@ class SparseLinearFunction(torch.autograd.Function):
                 input_flat, W_idx_N, W_idx_M, W_val, output
             )
         else:
+            jit_input = input_flat
+            if jit.options.unrolled_scalar:
+                jit_input = input_flat_t.contiguous()
             jit.call_forward(
                 B,
                 M,
                 N,
                 W_val.shape[0],
-                input_flat.data_ptr(),
+                jit_input.data_ptr(),
                 W_idx_N.data_ptr(),
                 W_idx_M.data_ptr(),
                 W_val.data_ptr(),
@@ -49,7 +52,9 @@ class SparseLinearFunction(torch.autograd.Function):
         if bias is not None:
             output += bias.view(-1, 1)
 
-        if B % TRANSPOSE_BLOCK_SIZE == 0 and N % TRANSPOSE_BLOCK_SIZE == 0:
+        if not jit or not jit.options.unrolled_scalar:
+            output_t = output
+        elif B % TRANSPOSE_BLOCK_SIZE == 0 and N % TRANSPOSE_BLOCK_SIZE == 0:
             output_t = torch.zeros(B, N)
             sppb.transpose(output, output_t, TRANSPOSE_BLOCK_SIZE)
         else:

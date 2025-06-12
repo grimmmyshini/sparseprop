@@ -1,13 +1,20 @@
 from concurrent.futures import ThreadPoolExecutor, wait
 import ctypes
+import time
 from llvmlite import ir, binding
 
 from sparseprop.modules.jit_utils import JITOptions
 
+
 class LinearJIT:
-    def __init__(self, jit_options=JITOptions(), name="jit_sparse_linear_forward"):
+    def __init__(self, W_val, W_idx, W_shape, jit_options=JITOptions(), name="jit_sparse_linear_forward"):
         self.options = jit_options
         self.unroll_times = jit_options.batch_size // 8
+
+        self.W_val = W_val
+        self.W_idx_N, self.W_idx_M = W_idx
+        self.N = W_shape[0]
+        self.M = W_shape[0]
 
         self.fn_fwd = None
         self.fn_bwd = None
@@ -35,6 +42,14 @@ class LinearJIT:
                 ir.VectorType(ir.FloatType(), 8), 3 * [ir.VectorType(ir.FloatType(), 8)]
             ),
             name="llvm.fma.v8f32",
+        )
+
+        self.fma_float = ir.Function(
+            self.module,
+            ir.FunctionType(
+                ir.FloatType(), [ir.FloatType(), ir.FloatType(), ir.FloatType()]
+            ),
+            name="llvm.fma.f32",
         )
 
         ############# Printf
@@ -139,33 +154,41 @@ class LinearJIT:
                 builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 8)), j)
                 builder.branch(block_loop)
 
-    def _jit_forward(self, fn_name="sparse_fwd"):
-        # void fn(int B, int M, int N_start, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M, float* W_val, float* O)
-        float_ptr_ty = ir.PointerType(ir.FloatType())
-        int_ptr_ty = ir.PointerType(ir.IntType(32))
+    def _jit_forward_unrolled_scalar(
+        self, builder, B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
+    ):
+        # Only call this with non transposed inputs!
+        # As otherwise we would have bad spatial locality
+        j = builder.alloca(ir.IntType(32), name="j")
+        builder.store(N_start, j)
+
+        batch_loop = builder.append_basic_block("batch_loop")
+        builder.branch(batch_loop)
+        builder.position_at_start(batch_loop)
+
+        j_val = builder.load(j)
+
+        cond = builder.icmp_signed("<", j_val, B)
+        with builder.if_then(cond):
+            for i in range(self.N):
+                for k in range(self.W_idx_N[i], self.W_idx_N[i + 1]):
+                        idx = builder.mul(j_val, B)
+                        w = builder.gep(W_val, [ir.Constant(ir.IntType(32), k)])
+                        x = builder.gep(X, [builder.add(idx, ir.Constant(ir.IntType(32), self.W_idx_M[k].item()))])
+                        o = builder.gep(O, [builder.add(idx, ir.Constant(ir.IntType(32), i))])
+                        fma = builder.call(
+                            self.fma_float,
+                            [builder.load(x), builder.load(w), builder.load(o)],
+                        )
+                        builder.store(fma, o)
+            builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
+            builder.branch(batch_loop)
+
+    def _jit_forward_vec(
+        self, builder, B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
+    ):
         int_ty = ir.IntType(32)
         vec_float_ty = ir.VectorType(ir.FloatType(), 8)
-        func_ty = ir.FunctionType(
-            ir.VoidType(),
-            [
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                float_ptr_ty,
-                int_ptr_ty,
-                int_ptr_ty,
-                float_ptr_ty,
-                float_ptr_ty,
-            ],
-        )
-
-        func = ir.Function(self.module, func_ty, name=fn_name)
-        B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O = func.args
-
-        block = func.append_basic_block(name="entry")
-        builder = ir.IRBuilder(block)
 
         # for(int i = 0; i < N; i++){
         i = builder.alloca(int_ty, name="i")
@@ -220,6 +243,38 @@ class LinearJIT:
 
             builder.store(builder.add(i_val, ir.Constant(int_ty, 1)), i)
             builder.branch(outer_loop)
+
+    def _jit_forward(self, fn_name="sparse_fwd"):
+        # void fn(int B, int M, int N_start, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M, float* W_val, float* O)
+        float_ptr_ty = ir.PointerType(ir.FloatType())
+        int_ptr_ty = ir.PointerType(ir.IntType(32))
+        int_ty = ir.IntType(32)
+        func_ty = ir.FunctionType(
+            ir.VoidType(),
+            [
+                int_ty,
+                int_ty,
+                int_ty,
+                int_ty,
+                int_ty,
+                float_ptr_ty,
+                int_ptr_ty,
+                int_ptr_ty,
+                float_ptr_ty,
+                float_ptr_ty,
+            ],
+        )
+
+        func = ir.Function(self.module, func_ty, name=fn_name)
+
+        block = func.append_basic_block(name="entry")
+        builder = ir.IRBuilder(block)
+
+        if self.options.unrolled_scalar:
+            self._jit_forward_unrolled_scalar(builder, *func.args)
+        else:
+            self._jit_forward_vec(builder, *func.args)
+
         builder.ret_void()
 
         llvm_ir = str(self.module)
@@ -552,7 +607,6 @@ class LinearJIT:
 
         if not self.fn_fwd:
             self._jit_forward()
-
         self._call(worker, N, num_threads)
 
     def call_backward(
@@ -588,5 +642,4 @@ class LinearJIT:
 
         if not self.fn_bwd:
             self._jit_backward()
-
         self._call(worker, N, num_threads)

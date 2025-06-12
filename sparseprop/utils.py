@@ -4,6 +4,7 @@ from copy import deepcopy
 from sparseprop.modules.linear import SparseLinear
 from sparseprop.modules.conv2d import SparseConv2d
 from sparseprop.modules import sparsify_if_faster
+from sparseprop.modules.jit_utils import JITOptions
 
 @torch.no_grad()
 def sparsity(module):
