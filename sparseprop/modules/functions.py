@@ -52,9 +52,7 @@ class SparseLinearFunction(torch.autograd.Function):
         if bias is not None:
             output += bias.view(-1, 1)
 
-        if not jit or not jit.options.unrolled_scalar:
-            output_t = output
-        elif B % TRANSPOSE_BLOCK_SIZE == 0 and N % TRANSPOSE_BLOCK_SIZE == 0:
+        if B % TRANSPOSE_BLOCK_SIZE == 0 and N % TRANSPOSE_BLOCK_SIZE == 0:
             output_t = torch.zeros(B, N)
             sppb.transpose(output, output_t, TRANSPOSE_BLOCK_SIZE)
         else:
@@ -110,7 +108,6 @@ class SparseLinearFunction(torch.autograd.Function):
             grad_bias = grad_output_t.sum(
                 [i for i in range(len(grad_output_t.shape) - 1)]
             )
-
         return grad_input_t, grad_W_val, None, grad_bias, None, None
 
 

@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, wait
+from threading import Thread
+
 import ctypes
 import time
 from llvmlite import ir, binding
@@ -6,18 +8,28 @@ from llvmlite import ir, binding
 from sparseprop.modules.jit_utils import JITOptions
 
 
+# Batch size should be multiples of 8
 class LinearJIT:
-    def __init__(self, W_val, W_idx, W_shape, jit_options=JITOptions(), name="jit_sparse_linear_forward"):
+    def __init__(
+        self,
+        W_val,
+        W_idx,
+        W_shape,
+        jit_options=JITOptions(),
+        name="jit_sparse_linear_forward",
+    ):
         self.options = jit_options
         self.unroll_times = jit_options.batch_size // 8
 
         self.W_val = W_val
         self.W_idx_N, self.W_idx_M = W_idx
         self.N = W_shape[0]
-        self.M = W_shape[0]
+        self.M = W_shape[1]
 
         self.fn_fwd = None
         self.fn_bwd = None
+
+        self.back_jit_thread = None
 
         # Initialize LLVM
         binding.initialize()
@@ -52,19 +64,42 @@ class LinearJIT:
             name="llvm.fma.f32",
         )
 
+        self.gather = ir.Function(
+            self.module,
+            ir.FunctionType(
+                ir.VectorType(ir.FloatType(), 8),
+                [
+                    ir.VectorType(ir.FloatType(), 8),  # Passthrough
+                    ir.PointerType(ir.FloatType()),  # base address pointer
+                    ir.VectorType(ir.IntType(32), 8),  # indices
+                    ir.VectorType(ir.FloatType(), 8),  # Mask
+                    ir.IntType(8),  # scale (as i8)
+                ],
+            ),
+            name="llvm.x86.avx2.gather.d.ps",
+        )
+
+        self.hadd = ir.Function(
+            self.module,
+            ir.FunctionType(
+                ir.VectorType(ir.FloatType(), 4),
+                [ir.VectorType(ir.FloatType(), 4), ir.VectorType(ir.FloatType(), 4)],
+            ),
+            name="llvm.x86.sse3.hadd.ps",
+        )
         ############# Printf
-        # printf_ty = ir.FunctionType(
-        #     ir.IntType(32), [ir.PointerType(ir.IntType(8))], var_arg=True
-        # )
-        # printf = ir.Function(self.module, printf_ty, name="printf")
+        printf_ty = ir.FunctionType(
+            ir.IntType(32), [ir.PointerType(ir.IntType(8))], var_arg=True
+        )
+        self.printf = ir.Function(self.module, printf_ty, name="printf")
 
-        # fmt_str = "%d\n\0"
-        # fmt_bytes = bytearray(fmt_str.encode("utf8"))
-        # fmt_type = ir.ArrayType(ir.IntType(8), len(fmt_bytes))
+        fmt_str = "%d\n\0"
+        fmt_bytes = bytearray(fmt_str.encode("utf8"))
+        fmt_type = ir.ArrayType(ir.IntType(8), len(fmt_bytes))
 
-        # global_fmt = ir.GlobalVariable(self.module, fmt_type, name="fstr")
-        # global_fmt.global_constant = True
-        # global_fmt.initializer = ir.Constant(fmt_type, fmt_bytes)
+        self.global_fmt = ir.GlobalVariable(self.module, fmt_type, name="fstr")
+        self.global_fmt.global_constant = True
+        self.global_fmt.initializer = ir.Constant(fmt_type, fmt_bytes)
         ############# Printf
 
     def add_unrolling(self, B):
@@ -79,19 +114,34 @@ class LinearJIT:
         self.unroll_times = B // 8
 
     @staticmethod
-    def vec_load_arr(builder, arr, idx, name=None):
-        vec_float_ty = ir.VectorType(ir.FloatType(), 8)
+    def vec_load_arr(
+        builder, arr, idx, type=ir.VectorType(ir.FloatType(), 8), name=None
+    ):
         if name is not None:
-            vec = builder.alloca(vec_float_ty, name=name)
+            vec = builder.alloca(type, name=name)
         else:
-            vec = builder.alloca(vec_float_ty)
+            vec = builder.alloca(type)
         builder.store(
             builder.load(
-                builder.bitcast(builder.gep(arr, [idx]), ir.PointerType(vec_float_ty))
+                builder.bitcast(builder.gep(arr, [idx]), ir.PointerType(type))
             ),
             vec,
         )
         return vec
+
+    @staticmethod
+    def vec_set(builder, vec, element):
+        replaced = builder.insert_element(
+            builder.load(vec),
+            element,
+            ir.Constant(ir.IntType(32), 0),
+        )
+        set = builder.shuffle_vector(
+            replaced,
+            replaced,
+            ir.Constant(ir.VectorType(ir.IntType(32), 8), 0),
+        )
+        builder.store(set, vec)
 
     @staticmethod
     def optimize(module, target_machine):
@@ -155,12 +205,12 @@ class LinearJIT:
                 builder.branch(block_loop)
 
     def _jit_forward_unrolled_scalar(
-        self, builder, B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
+        self, builder, pstart, pend, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
     ):
         # Only call this with non transposed inputs!
         # As otherwise we would have bad spatial locality
         j = builder.alloca(ir.IntType(32), name="j")
-        builder.store(N_start, j)
+        builder.store(pstart, j)
 
         batch_loop = builder.append_basic_block("batch_loop")
         builder.branch(batch_loop)
@@ -168,31 +218,180 @@ class LinearJIT:
 
         j_val = builder.load(j)
 
-        cond = builder.icmp_signed("<", j_val, B)
+        cond = builder.icmp_signed("<", j_val, pend)
         with builder.if_then(cond):
             for i in range(self.N):
+                o_idx = None
                 for k in range(self.W_idx_N[i], self.W_idx_N[i + 1]):
-                        idx = builder.mul(j_val, B)
-                        w = builder.gep(W_val, [ir.Constant(ir.IntType(32), k)])
-                        x = builder.gep(X, [builder.add(idx, ir.Constant(ir.IntType(32), self.W_idx_M[k].item()))])
-                        o = builder.gep(O, [builder.add(idx, ir.Constant(ir.IntType(32), i))])
-                        fma = builder.call(
-                            self.fma_float,
-                            [builder.load(x), builder.load(w), builder.load(o)],
+                    if not o_idx:
+                        o_idx = builder.add(
+                            builder.mul(ir.Constant(ir.IntType(32), i), B),
+                            j_val,
                         )
-                        builder.store(fma, o)
+                    w = builder.gep(W_val, [ir.Constant(ir.IntType(32), k)])
+                    x = builder.gep(
+                        X,
+                        [
+                            builder.add(
+                                builder.mul(j_val, ir.Constant(ir.IntType(32), self.M)),
+                                ir.Constant(ir.IntType(32), self.W_idx_M[k].item()),
+                            )
+                        ],
+                    )
+                    o = builder.gep(O, [o_idx])
+                    fma = builder.call(
+                        self.fma_float,
+                        [builder.load(x), builder.load(w), builder.load(o)],
+                    )
+                    builder.store(fma, o)
+            builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
+            builder.branch(batch_loop)
+
+    def _jit_forward_unrolled_vector(
+        self, builder, pstart, pend, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
+    ):
+        # Only call this with non transposed inputs!
+        # As otherwise we would have bad spatial locality
+        mask = ir.Constant(ir.VectorType(ir.FloatType(), 8), -1)
+        passthrough = ir.Constant(ir.VectorType(ir.FloatType(), 8), 0)
+        scale = ir.Constant(ir.IntType(8), 4)
+        vec_float_half_ty = ir.VectorType(ir.FloatType(), 4)
+        out = None
+        # fmt_ptr = builder.bitcast(self.global_fmt, ir.PointerType(ir.IntType(8)))
+
+        idx_vec = builder.alloca(ir.VectorType(ir.IntType(32), 8))
+        out = builder.alloca(ir.VectorType(ir.FloatType(), 8))
+        builder.store(ir.Constant(ir.VectorType(ir.FloatType(), 8), 0), out)
+        builder.store(ir.Constant(ir.VectorType(ir.IntType(32), 8), 0), idx_vec)
+
+        j = builder.alloca(ir.IntType(32), name="j")
+        builder.store(pstart, j)
+        LinearJIT.vec_set(builder, idx_vec, pstart)
+
+        batch_loop = builder.append_basic_block("batch_loop")
+        builder.branch(batch_loop)
+        builder.position_at_start(batch_loop)
+
+        j_val = builder.load(j)
+        cond = builder.icmp_signed("<", j_val, pend)
+        with builder.if_then(cond):
+            for i in range(self.N):
+                k = self.W_idx_N[i].item()
+                # Locality wrt to accesses to O is BAD here!!
+                if k < self.W_idx_N[i + 1]:
+                    o_idx = builder.add(
+                        builder.mul(ir.Constant(ir.IntType(32), i), B),
+                        j_val,
+                    )
+                else:
+                    o_idx = None
+                do_vec = k < self.W_idx_N[i + 1] - 7
+
+                while k < self.W_idx_N[i + 1] - 7:
+                    w = LinearJIT.vec_load_arr(
+                        builder, W_val, ir.Constant(ir.IntType(32), k)
+                    )
+                    x_idx = builder.add(
+                        builder.load(idx_vec),
+                        ir.Constant(
+                            ir.VectorType(ir.IntType(32), 8),
+                            [self.W_idx_M[k + b].item() for b in range(0, 8)],
+                        ),
+                    )
+                    x = builder.call(
+                        self.gather,
+                        [passthrough, X, x_idx, mask, scale],
+                    )
+                    # x = ir.Constant(ir.VectorType(ir.FloatType(), 8), 0)
+                    fma = builder.call(
+                        self.fma_intr,
+                        [x, builder.load(w), builder.load(out)],
+                    )
+                    builder.store(fma, out)
+                    k += 8
+
+                # horizontal sum over O before we move to scalar
+                if do_vec:
+                    # _mm256_castps256_ps128(v);
+                    low = builder.alloca(vec_float_half_ty)
+                    builder.store(
+                        builder.shuffle_vector(
+                            builder.load(out),
+                            builder.load(out),
+                            ir.Constant(ir.VectorType(ir.IntType(32), 4), [0, 1, 2, 3]),
+                        ),
+                        low,
+                    )
+                    # mm256_extractf128_ps(v, 1);
+                    high = builder.alloca(vec_float_half_ty)
+                    builder.store(
+                        builder.shuffle_vector(
+                            builder.load(out),
+                            builder.load(out),
+                            ir.Constant(ir.VectorType(ir.IntType(32), 4), [4, 5, 6, 7]),
+                        ),
+                        high,
+                    )
+                    # _mm_add_ps(low, high);
+                    low_high_add = builder.fadd(builder.load(low), builder.load(high))
+                    # _mm_hadd_ps(sum, sum);
+                    low_sum = builder.call(
+                        self.hadd,
+                        [low_high_add, low_high_add],
+                    )
+                    # _mm_hadd_ps(sum, sum);
+                    full_sum = builder.call(
+                        self.hadd,
+                        [low_sum, low_sum],
+                    )
+                    # _mm_cvtss_f32(sum);
+                    cvt = builder.extract_element(
+                        full_sum, ir.Constant(ir.IntType(32), 0)
+                    )
+                    O_ele = builder.gep(O, [o_idx])
+                    builder.store(
+                        builder.fadd(builder.load(O_ele), cvt),
+                        O_ele,
+                    )
+                    builder.store(ir.Constant(ir.VectorType(ir.FloatType(), 8), 0), out)
+
+                while k < self.W_idx_N[i + 1]:
+                    w = builder.gep(W_val, [ir.Constant(ir.IntType(32), k)])
+                    x = builder.gep(
+                        X,
+                        [
+                            builder.add(
+                                builder.mul(j_val, ir.Constant(ir.IntType(32), self.M)),
+                                ir.Constant(ir.IntType(32), self.W_idx_M[k].item()),
+                            )
+                        ],
+                    )
+                    o = builder.gep(O, [o_idx])
+                    fma = builder.call(
+                        self.fma_float,
+                        [builder.load(x), builder.load(w), builder.load(o)],
+                    )
+                    builder.store(fma, o)
+                    k += 1
+            builder.store(
+                builder.add(
+                    builder.load(idx_vec),
+                    ir.Constant(ir.VectorType(ir.IntType(32), 8), [self.M] * 8),
+                ),
+                idx_vec,
+            )
             builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
             builder.branch(batch_loop)
 
     def _jit_forward_vec(
-        self, builder, B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
+        self, builder, pstart, pend, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
     ):
         int_ty = ir.IntType(32)
         vec_float_ty = ir.VectorType(ir.FloatType(), 8)
 
         # for(int i = 0; i < N; i++){
         i = builder.alloca(int_ty, name="i")
-        builder.store(N_start, i)
+        builder.store(pstart, i)
 
         outer_loop = builder.append_basic_block("outer_loop")
         builder.branch(outer_loop)
@@ -200,7 +399,7 @@ class LinearJIT:
 
         i_val = builder.load(i)
 
-        cond = builder.icmp_signed("<", i_val, N)
+        cond = builder.icmp_signed("<", i_val, pend)
         with builder.if_then(cond):
             # int k = W_idx_N[i];
             k = builder.alloca(int_ty, name="k")
@@ -224,17 +423,7 @@ class LinearJIT:
 
                 # __m256 v = _mm256_set1_ps(W_val[k]);
                 v = builder.alloca(vec_float_ty, name="v")
-                v_replaced = builder.insert_element(
-                    builder.load(v),
-                    builder.load(builder.gep(W_val, [k_val])),
-                    ir.Constant(int_ty, 0),
-                )
-                v_set = builder.shuffle_vector(
-                    v_replaced,
-                    v_replaced,
-                    ir.Constant(ir.VectorType(int_ty, 8), 0),
-                )
-                builder.store(v_set, v)
+                LinearJIT.vec_set(builder, v, builder.load(builder.gep(W_val, [k_val])))
 
                 self.fwd_block_loop(builder, B, idx, i_val, X, O, v)
 
@@ -245,13 +434,14 @@ class LinearJIT:
             builder.branch(outer_loop)
 
     def _jit_forward(self, fn_name="sparse_fwd"):
-        # void fn(int B, int M, int N_start, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M, float* W_val, float* O)
+        # void fn(int pstart, int pend, int B, int M, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M, float* W_val, float* O)
         float_ptr_ty = ir.PointerType(ir.FloatType())
         int_ptr_ty = ir.PointerType(ir.IntType(32))
         int_ty = ir.IntType(32)
         func_ty = ir.FunctionType(
             ir.VoidType(),
             [
+                int_ty,
                 int_ty,
                 int_ty,
                 int_ty,
@@ -271,7 +461,7 @@ class LinearJIT:
         builder = ir.IRBuilder(block)
 
         if self.options.unrolled_scalar:
-            self._jit_forward_unrolled_scalar(builder, *func.args)
+            self._jit_forward_unrolled_vector(builder, *func.args)
         else:
             self._jit_forward_vec(builder, *func.args)
 
@@ -289,6 +479,7 @@ class LinearJIT:
 
         self.fn_fwd = ctypes.CFUNCTYPE(
             None,
+            ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
@@ -371,7 +562,7 @@ class LinearJIT:
                 builder.branch(block_loop)
 
     def _jit_backward(self, fn_name="sparse_bwd"):
-        # void fn(int B, int M, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M,float* W_val, float* dLdO, float* dLdX, float* dLdW_val)
+        # void fn(int pstart, int pend, int B, int M, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M,float* W_val, float* dLdO, float* dLdX, float* dLdW_val)
         float_ptr_ty = ir.PointerType(ir.FloatType())
         int_ptr_ty = ir.PointerType(ir.IntType(32))
         int_ty = ir.IntType(32)
@@ -380,6 +571,7 @@ class LinearJIT:
         func_ty = ir.FunctionType(
             ir.VoidType(),
             [
+                int_ty,
                 int_ty,
                 int_ty,
                 int_ty,
@@ -396,16 +588,28 @@ class LinearJIT:
         )
 
         func = ir.Function(self.module, func_ty, name=fn_name)
-        B, M, N_start, N, W_nnz, X, W_idx_N, W_idx_M, W_val, dLdO, dLdX, dLdW_val = (
-            func.args
-        )
+        (
+            pstart,
+            pend,
+            B,
+            M,
+            N,
+            W_nnz,
+            X,
+            W_idx_N,
+            W_idx_M,
+            W_val,
+            dLdO,
+            dLdX,
+            dLdW_val,
+        ) = func.args
 
         block = func.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
 
         # for(int i = 0; i < N; i++){
         i = builder.alloca(int_ty, name="i")
-        builder.store(N_start, i)
+        builder.store(pstart, i)
 
         outer_loop = builder.append_basic_block("outer_loop")
         builder.branch(outer_loop)
@@ -413,7 +617,7 @@ class LinearJIT:
 
         i_val = builder.load(i)
 
-        cond = builder.icmp_signed("<", i_val, N)
+        cond = builder.icmp_signed("<", i_val, pend)
         with builder.if_then(cond):
             # for(int j = W_idx_N[i]; j < W_idx_N[i+1]; j++){
             j = builder.alloca(int_ty, name="j")
@@ -440,13 +644,7 @@ class LinearJIT:
 
                 # __m256 v = _mm256_set1_ps(sv);
                 v = builder.alloca(vec_float_ty, name="v")
-                v_replaced = builder.insert_element(
-                    builder.load(v), builder.load(sv), ir.Constant(int_ty, 0)
-                )
-                v_set = builder.shuffle_vector(
-                    v_replaced, v_replaced, ir.Constant(ir.VectorType(int_ty, 8), 0)
-                )
-                builder.store(v_set, v)
+                LinearJIT.vec_set(builder, v, builder.load(sv))
 
                 # float sacc = 0;
                 sacc = builder.alloca(ir.FloatType(), name="sacc")
@@ -562,6 +760,7 @@ class LinearJIT:
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
+            ctypes.c_int,
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int),
@@ -573,30 +772,32 @@ class LinearJIT:
 
         ctypes.CDLL(None)
 
-    def _call(self, worker, N, num_threads):
-        if self.options.parallel:
-            chunk_size = (N + num_threads - 1) // num_threads
-            with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                futures = []
-                for i in range(num_threads):
-                    futures.append(
-                        executor.submit(
-                            worker, i * chunk_size, min((i + 1) * chunk_size, N)
-                        )
-                    )
-                wait(futures)
-        else:
-            worker(0, N)
+    def _call(self, worker, loop_size, num_threads):
+        if not self.options.parallel:
+            worker(0, loop_size)
+            return
+
+        chunk_size = (loop_size + num_threads - 1) // num_threads
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = []
+            for i in range(num_threads):
+                start = i * chunk_size
+                end = min(start + chunk_size, loop_size)
+                futures.append(executor.submit(worker, start, end))
+
+            wait(futures)
 
     def call_forward(
         self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output, num_threads=4
     ):
-        def worker(n_start, n_end):
+        def worker(start, end):
             self.fn_fwd(
+                start,
+                end,
                 B,
                 M,
-                n_start,
-                n_end,
+                N,
                 W_nnz,
                 ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
                 ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
@@ -605,9 +806,16 @@ class LinearJIT:
                 ctypes.cast(output, ctypes.POINTER(ctypes.c_float)),
             )
 
+        # start = time.time()
         if not self.fn_fwd:
+            # Also spin up the backward jit-er
+            if not self.fn_bwd:
+                self.back_jit_thread = Thread(target=self._jit_backward)
+                self.back_jit_thread.start()
             self._jit_forward()
-        self._call(worker, N, num_threads)
+        # print("Jit time (approx):", time.time() - start)
+
+        self._call(worker, B if self.options.unrolled_scalar else N, num_threads)
 
     def call_backward(
         self,
@@ -624,12 +832,13 @@ class LinearJIT:
         dLdW_val,
         num_threads=4,
     ):
-        def worker(n_start, n_end):
+        def worker(start, end):
             self.fn_bwd(
+                start,
+                end,
                 B,
                 M,
-                n_start,
-                n_end,
+                N,
                 W_nnz,
                 ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
                 ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
@@ -641,5 +850,6 @@ class LinearJIT:
             )
 
         if not self.fn_bwd:
-            self._jit_backward()
+            self.back_jit_thread.join()
+
         self._call(worker, N, num_threads)
