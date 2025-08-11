@@ -25,6 +25,9 @@ class LinearJIT:
         self.W_idx_N, self.W_idx_M = W_idx
         self.N = W_shape[0]
         self.M = W_shape[1]
+        self.codelets, self.trace, self.non_strided_N = self.find_strides(
+            self.N, self.W_idx_N, self.W_idx_M
+        )
 
         self.fn_fwd = None
         self.fn_bwd = None
@@ -101,6 +104,224 @@ class LinearJIT:
         self.global_fmt.global_constant = True
         self.global_fmt.initializer = ir.Constant(fmt_type, fmt_bytes)
         ############# Printf
+
+    def find_strides(self, n, row_idx, col_idx):
+        trace = []
+        for i in range(n):
+            k = range(row_idx[i], row_idx[i + 1])
+            trace.append(list(zip(k, [col_idx[j].item() for j in k])))
+
+        sorted_indices = sorted(range(len(trace)), key=lambda i: len(trace[i]))
+        orig_trace = trace.copy()
+        trace = [trace[i] for i in sorted_indices]
+
+        k = 0
+        codelets = []
+        visited = [
+            False for _ in range(n)
+        ]  # Keep track of indices already included in codelets
+        while k < len(trace):
+            curr_len = len(trace[k])
+            if visited[k] or curr_len <= 1:
+                k += 1
+                continue
+            target_offset = [
+                (k2 - k1, W_idx2 - W_idx1)
+                for (k1, W_idx1), (k2, W_idx2) in zip(trace[k], trace[k][1:])
+            ]
+            scale = None
+            i = k + 1
+            codelet = {}
+            while i < len(trace) and len(trace[i]) == curr_len:
+                outer_iter = [
+                    (k2 - k1, W_idx2 - W_idx1)
+                    for (k1, W_idx1), (k2, W_idx2) in zip(trace[k], trace[i])
+                ]
+                outer = all(t == outer_iter[0] for t in outer_iter)
+                if outer and not scale:
+                    scale = outer_iter[0]
+                if outer and scale == outer_iter[0]:
+                    curr_offset = [
+                        (k2 - k1, W_idx2 - W_idx1)
+                        for (k1, W_idx1), (k2, W_idx2) in zip(trace[i], trace[i][1:])
+                    ]
+                    # codelet is strided
+                    if target_offset == curr_offset:
+                        if not codelet:
+                            codelet = {
+                                "len": curr_len,
+                                "x_offset": [trace[k][0][1]]
+                                + [x for (_, x) in target_offset],
+                                "w_offset": [trace[k][0][0]]
+                                + [x for (x, _) in target_offset],
+                                "w_scale": scale[0],
+                                "x_scale": scale[1],
+                                "o_idx": [sorted_indices[k]],
+                                "o_scale": sorted_indices[i] - sorted_indices[k],
+                            }
+                            visited[k] = True
+
+                        # Since relative order is maintained while sorting by len,
+                        # We just check against the last element
+                        if codelet["o_scale"] == (
+                            sorted_indices[i] - codelet["o_idx"][-1]
+                        ):
+                            codelet["o_idx"].append(sorted_indices[i])
+                            visited[i] = True
+                            scale = (
+                                scale[0] + outer_iter[0][0],
+                                scale[1] + outer_iter[0][1],
+                            )
+                    else:
+                        scale = None
+                i += 1
+            if codelet:
+                print(codelet)
+                codelets.append(codelet)
+            k += 1
+        return (
+            codelets,
+            orig_trace,
+            [sorted_indices[i] for i, val in enumerate(visited) if not val],
+        )
+
+    def gen_fwd_codelet(
+        self,
+        codelet,
+        builder,
+        b_idx,
+        B,
+        X,
+        W_val,
+        O,
+    ):
+        i = builder.alloca(ir.IntType(32), name="i")
+        builder.store(
+            ir.Constant(ir.IntType(32), 0), i
+        )  # index O with this, so O[o_idx[0] + i * o_scale]
+        o_scale = ir.Constant(ir.IntType(32), codelet["o_scale"])
+        w_scale = ir.Constant(ir.IntType(32), codelet["w_scale"])
+        x_scale = ir.Constant(ir.IntType(32), codelet["x_scale"])
+        m = ir.Constant(ir.IntType(32), self.M)
+        o_offset = ir.Constant(ir.IntType(32), codelet["o_idx"][0])
+        w_offset = 0
+        x_offset = 0
+
+        batch_loop = builder.append_basic_block("codelet_loop")
+        builder.branch(batch_loop)
+        builder.position_at_start(batch_loop)
+
+        i_val = builder.load(i)
+
+        cond = builder.icmp_signed(
+            "<", i_val, ir.Constant(ir.IntType(32), len(codelet["o_idx"]))
+        )
+        with builder.if_then(cond):
+            # Output is of dims N * Batch, this is for when we vectorize
+            o_idx = builder.add(
+                builder.mul(builder.add(builder.mul(i_val, o_scale), o_offset), B),
+                b_idx,
+            )
+            for j in range(codelet["len"]):
+                x_offset += codelet["x_offset"][j]
+                w_offset += codelet["w_offset"][j]
+
+                w_idx = builder.add(
+                    builder.mul(i_val, w_scale),
+                    ir.Constant(ir.IntType(32), w_offset),
+                )
+                w = builder.gep(W_val, [w_idx])
+
+                x_idx = builder.add(
+                    builder.mul(b_idx, m),
+                    builder.add(
+                        builder.mul(i_val, x_scale),
+                        ir.Constant(ir.IntType(32), x_offset),
+                    ),
+                )
+                x = builder.gep(X, [x_idx])
+
+                o = builder.gep(O, [o_idx])
+                fma = builder.call(
+                    self.fma_float,
+                    [builder.load(x), builder.load(w), builder.load(o)],
+                )
+                builder.store(fma, o)
+            builder.store(builder.add(i_val, ir.Constant(ir.IntType(32), 1)), i)
+            builder.branch(batch_loop)
+
+    def gen_bwd_codelet(
+        self, codelet, builder, b_idx, B, X, W_val, dLdO, dLdW_val, dLdX
+    ):
+        i = builder.alloca(ir.IntType(32), name="i")
+        builder.store(
+            ir.Constant(ir.IntType(32), 0), i
+        )  # index O with this, so O[o_idx[0] + i * o_scale]
+        outer_scale = ir.Constant(ir.IntType(32), codelet["o_scale"])
+        inner_scale = ir.Constant(ir.IntType(32), codelet["w_scale"])
+        sparse_scale = ir.Constant(ir.IntType(32), codelet["x_scale"])
+        m = ir.Constant(ir.IntType(32), self.M)
+        outer_offset = ir.Constant(ir.IntType(32), codelet["o_idx"][0])
+        inner_offset = 0
+        sparse_offset = 0
+
+        batch_loop = builder.append_basic_block("codelet_loop")
+        builder.branch(batch_loop)
+        builder.position_at_start(batch_loop)
+
+        i_val = builder.load(i)
+
+        cond = builder.icmp_signed(
+            "<", i_val, ir.Constant(ir.IntType(32), len(codelet["o_idx"]))
+        )
+        with builder.if_then(cond):
+            # Output is of dims N * Batch, this is for when we vectorize
+            outer_idx = builder.add(
+                builder.mul(
+                    builder.add(builder.mul(i_val, outer_scale), outer_offset), B
+                ),
+                b_idx,
+            )
+            for j in range(codelet["len"]):
+                sparse_offset += codelet["x_offset"][j]
+                inner_offset += codelet["w_offset"][j]
+
+                # dLdX[W_col[j]] += W_val[j] * dLdO[i];
+                inner_idx = builder.add(
+                    builder.mul(i_val, inner_scale),
+                    ir.Constant(ir.IntType(32), inner_offset),
+                )
+                w = builder.gep(W_val, [inner_idx])
+
+                dldo = builder.gep(dLdO, [outer_idx])
+
+                sparse_idx = builder.add(
+                    builder.mul(
+                        builder.add(
+                            builder.mul(i_val, sparse_scale),
+                            ir.Constant(ir.IntType(32), sparse_offset),
+                        ),
+                        B,
+                    ),
+                    b_idx,
+                )
+                output = builder.gep(dLdX, [sparse_idx])
+                fma = builder.call(
+                    self.fma_float,
+                    [builder.load(dldo), builder.load(w), builder.load(output)],
+                )
+                builder.store(fma, output)
+
+                # dLdW_val[j] += dLdO[i] * X[W_col[j]];
+                x = builder.gep(X, [sparse_idx])
+                output = builder.gep(dLdW_val, [inner_idx])
+                fma = builder.call(
+                    self.fma_float,
+                    [builder.load(dldo), builder.load(x), builder.load(output)],
+                )
+                builder.store(fma, output)
+            builder.store(builder.add(i_val, ir.Constant(ir.IntType(32), 1)), i)
+            builder.branch(batch_loop)
 
     def add_unrolling(self, B):
         # This is a bit tricky because ideally we want to re-jit as less as possible
@@ -204,6 +425,135 @@ class LinearJIT:
                 builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 8)), j)
                 builder.branch(block_loop)
 
+    def generate_fwd_unrolled_mm(self, builder, B, indices, b_idx, X, W_val, O):
+        # Output is of dims N * Batch
+        for i in indices:
+            o_idx = None
+            for k in range(self.W_idx_N[i], self.W_idx_N[i + 1]):
+                if not o_idx:
+                    o_idx = builder.add(
+                        builder.mul(ir.Constant(ir.IntType(32), i), B),
+                        b_idx,
+                    )
+                w = builder.gep(W_val, [ir.Constant(ir.IntType(32), k)])
+                x = builder.gep(
+                    X,
+                    [
+                        builder.add(
+                            builder.mul(b_idx, ir.Constant(ir.IntType(32), self.M)),
+                            ir.Constant(ir.IntType(32), self.W_idx_M[k].item()),
+                        )
+                    ],
+                )
+                o = builder.gep(O, [o_idx])
+                fma = builder.call(
+                    self.fma_float,
+                    [builder.load(x), builder.load(w), builder.load(o)],
+                )
+                builder.store(fma, o)
+
+    def generate_bwd_unrolled_mm(
+        self, builder, indices, b_idx, B, X, W_val, dLdO, dLdW_val, dLdX
+    ):
+        # Output is of dims N * Batch
+        for i in indices:
+            outer_idx = None
+            for k in range(self.W_idx_N[i], self.W_idx_N[i + 1]):
+                if not outer_idx:
+                    outer_idx = builder.add(
+                        builder.mul(ir.Constant(ir.IntType(32), i), B),
+                        b_idx,
+                    )
+                # dLdX[W_col[j]] += W_val[j] * dLdO[i];
+                inner_idx = ir.Constant(ir.IntType(32), k)
+                w = builder.gep(W_val, [inner_idx])
+                dldo = builder.gep(dLdO, [outer_idx])
+
+                sparse_idx = builder.add(
+                    builder.mul(
+                        ir.Constant(ir.IntType(32), self.W_idx_M[k].item()),
+                        B,
+                    ),
+                    b_idx,
+                )
+                output = builder.gep(dLdX, [sparse_idx])
+                fma = builder.call(
+                    self.fma_float,
+                    [builder.load(dldo), builder.load(w), builder.load(output)],
+                )
+                builder.store(fma, output)
+
+                # dLdW_val[j] += dLdO[i] * X[W_col[j]];
+                x = builder.gep(X, [sparse_idx])
+                output = builder.gep(dLdW_val, [inner_idx])
+                fma = builder.call(
+                    self.fma_float,
+                    [builder.load(dldo), builder.load(x), builder.load(output)],
+                )
+                builder.store(fma, output)
+
+    def _jit_forward_psc(
+        self, builder, pstart, pend, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
+    ):
+        j = builder.alloca(ir.IntType(32), name="j")
+        builder.store(pstart, j)
+
+        batch_loop = builder.append_basic_block("batch_loop")
+        builder.branch(batch_loop)
+        builder.position_at_start(batch_loop)
+
+        j_val = builder.load(j)
+
+        cond = builder.icmp_signed("<", j_val, pend)
+        with builder.if_then(cond):
+            for codelet in self.codelets:
+                self.gen_fwd_codelet(codelet, builder, j_val, B, X, W_val, O)
+            self.generate_fwd_unrolled_mm(
+                builder, B, self.non_strided_N, j_val, X, W_val, O
+            )
+
+            builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
+            builder.branch(batch_loop)
+
+    def _jit_backward_psc(
+        self,
+        builder,
+        pstart,
+        pend,
+        B,
+        M,
+        N,
+        W_nnz,
+        X,
+        W_idx_N,
+        W_idx_M,
+        W_val,
+        dLdO,
+        dLdX,
+        dLdW_val,
+    ):
+        j = builder.alloca(ir.IntType(32), name="j")
+        builder.store(pstart, j)
+
+        batch_loop = builder.append_basic_block("batch_loop")
+        builder.branch(batch_loop)
+        builder.position_at_start(batch_loop)
+
+        j_val = builder.load(j)
+
+        cond = builder.icmp_signed("<", j_val, pend)
+        with builder.if_then(cond):
+            for codelet in self.codelets:
+                self.gen_bwd_codelet(
+                    codelet, builder, j_val, B, X, W_val, dLdO, dLdW_val, dLdX
+                )
+            self.generate_bwd_unrolled_mm(
+                builder, self.non_strided_N, j_val, B, X, W_val, dLdO, dLdW_val, dLdX
+            )
+
+            builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
+            builder.branch(batch_loop)
+
     def _jit_forward_unrolled_scalar(
         self, builder, pstart, pend, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, O
     ):
@@ -220,30 +570,7 @@ class LinearJIT:
 
         cond = builder.icmp_signed("<", j_val, pend)
         with builder.if_then(cond):
-            for i in range(self.N):
-                o_idx = None
-                for k in range(self.W_idx_N[i], self.W_idx_N[i + 1]):
-                    if not o_idx:
-                        o_idx = builder.add(
-                            builder.mul(ir.Constant(ir.IntType(32), i), B),
-                            j_val,
-                        )
-                    w = builder.gep(W_val, [ir.Constant(ir.IntType(32), k)])
-                    x = builder.gep(
-                        X,
-                        [
-                            builder.add(
-                                builder.mul(j_val, ir.Constant(ir.IntType(32), self.M)),
-                                ir.Constant(ir.IntType(32), self.W_idx_M[k].item()),
-                            )
-                        ],
-                    )
-                    o = builder.gep(O, [o_idx])
-                    fma = builder.call(
-                        self.fma_float,
-                        [builder.load(x), builder.load(w), builder.load(o)],
-                    )
-                    builder.store(fma, o)
+            self.generate_fwd_unrolled_mm(builder, B, range(self.N), j_val, X, W_val, O)
             builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
             builder.branch(batch_loop)
 
@@ -460,16 +787,16 @@ class LinearJIT:
         block = func.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
 
-        if self.options.unrolled_scalar:
-            self._jit_forward_unrolled_vector(builder, *func.args)
-        else:
-            self._jit_forward_vec(builder, *func.args)
-
+        # if self.options.unrolled_scalar:
+        #     self._jit_forward_unrolled_vector(builder, *func.args)
+        # else:
+        #     self._jit_forward_vec(builder, *func.args)
+        self._jit_forward_psc(builder, *func.args)
         builder.ret_void()
 
         llvm_ir = str(self.module)
-        mod = binding.parse_assembly(llvm_ir)
 
+        mod = binding.parse_assembly(llvm_ir)
         LinearJIT.optimize(mod, self.target_machine)
 
         self.engine.add_module(mod)
@@ -561,52 +888,26 @@ class LinearJIT:
                 builder.store(builder.add(k_val, ir.Constant(ir.IntType(32), 8)), k)
                 builder.branch(block_loop)
 
-    def _jit_backward(self, fn_name="sparse_bwd"):
-        # void fn(int pstart, int pend, int B, int M, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M,float* W_val, float* dLdO, float* dLdX, float* dLdW_val)
-        float_ptr_ty = ir.PointerType(ir.FloatType())
-        int_ptr_ty = ir.PointerType(ir.IntType(32))
+    def _jit_backward_vec(
+        self,
+        builder,
+        pstart,
+        pend,
+        B,
+        M,
+        N,
+        W_nnz,
+        X,
+        W_idx_N,
+        W_idx_M,
+        W_val,
+        dLdO,
+        dLdX,
+        dLdW_val,
+    ):
         int_ty = ir.IntType(32)
         vec_float_ty = ir.VectorType(ir.FloatType(), 8)
         vec_float_half_ty = ir.VectorType(ir.FloatType(), 4)
-        func_ty = ir.FunctionType(
-            ir.VoidType(),
-            [
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                float_ptr_ty,
-                int_ptr_ty,
-                int_ptr_ty,
-                float_ptr_ty,
-                float_ptr_ty,
-                float_ptr_ty,
-                float_ptr_ty,
-            ],
-        )
-
-        func = ir.Function(self.module, func_ty, name=fn_name)
-        (
-            pstart,
-            pend,
-            B,
-            M,
-            N,
-            W_nnz,
-            X,
-            W_idx_N,
-            W_idx_M,
-            W_val,
-            dLdO,
-            dLdX,
-            dLdW_val,
-        ) = func.args
-
-        block = func.append_basic_block(name="entry")
-        builder = ir.IRBuilder(block)
-
         # for(int i = 0; i < N; i++){
         i = builder.alloca(int_ty, name="i")
         builder.store(pstart, i)
@@ -741,6 +1042,38 @@ class LinearJIT:
 
             builder.store(builder.add(i_val, ir.Constant(int_ty, 1)), i)
             builder.branch(outer_loop)
+
+    def _jit_backward(self, fn_name="sparse_bwd"):
+        # void fn(int pstart, int pend, int B, int M, int N, int W_nnz, float* X, int* W_idx_N, int* W_idx_M,float* W_val, float* dLdO, float* dLdX, float* dLdW_val)
+        float_ptr_ty = ir.PointerType(ir.FloatType())
+        int_ptr_ty = ir.PointerType(ir.IntType(32))
+        int_ty = ir.IntType(32)
+        func_ty = ir.FunctionType(
+            ir.VoidType(),
+            [
+                int_ty,
+                int_ty,
+                int_ty,
+                int_ty,
+                int_ty,
+                int_ty,
+                float_ptr_ty,
+                int_ptr_ty,
+                int_ptr_ty,
+                float_ptr_ty,
+                float_ptr_ty,
+                float_ptr_ty,
+                float_ptr_ty,
+            ],
+        )
+
+        func = ir.Function(self.module, func_ty, name=fn_name)
+
+        block = func.append_basic_block(name="entry")
+        builder = ir.IRBuilder(block)
+
+        # self._jit_backward_vec(builder, *func.args)
+        self._jit_backward_psc(builder, *func.args)
         builder.ret_void()
 
         llvm_ir = str(self.module)
@@ -809,9 +1142,9 @@ class LinearJIT:
         # start = time.time()
         if not self.fn_fwd:
             # Also spin up the backward jit-er
-            if not self.fn_bwd:
-                self.back_jit_thread = Thread(target=self._jit_backward)
-                self.back_jit_thread.start()
+            # if not self.fn_bwd:
+            #     self.back_jit_thread = Thread(target=self._jit_backward)
+            #     self.back_jit_thread.start()
             self._jit_forward()
         # print("Jit time (approx):", time.time() - start)
 
@@ -850,6 +1183,7 @@ class LinearJIT:
             )
 
         if not self.fn_bwd:
-            self.back_jit_thread.join()
+            # self.back_jit_thread.join()
+            self._jit_backward()
 
-        self._call(worker, N, num_threads)
+        self._call(worker, B if self.options.unrolled_scalar else N, num_threads)
