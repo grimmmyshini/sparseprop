@@ -9,7 +9,7 @@ TRANSPOSE_BLOCK_SIZE = 16
 
 class SparseLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, inputT, W_val, W_idx, bias, N, jit=None):
+    def forward(ctx, inputT, W_val, W_idx, bias, N, jit=None, jit_reg_idx=None):
         input_flat_t = inputT.reshape(-1, inputT.shape[-1])
         B, M = input_flat_t.shape
         if B % TRANSPOSE_BLOCK_SIZE == 0 and M % TRANSPOSE_BLOCK_SIZE == 0:
@@ -47,7 +47,10 @@ class SparseLinearFunction(torch.autograd.Function):
 
         ctx.jit = jit
         ctx.save_for_backward(W_val, bias)
-        ctx.svd = (input_flat, W_idx_N, W_idx_M)
+        if jit and jit.options.reg_tiling:
+            ctx.svd = (input_flat, jit_reg_idx[0], jit_reg_idx[1], jit_reg_idx[2])
+        else:
+            ctx.svd = (input_flat, W_idx_N, W_idx_M, None)
 
         if bias is not None:
             output += bias.view(-1, 1)
@@ -63,7 +66,7 @@ class SparseLinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output_t):
         W_val, bias = ctx.saved_tensors
-        input_flat, W_idx_N, W_idx_M = ctx.svd
+        input_flat, W_idx_N, W_idx_M, jit_recreate_idx = ctx.svd
 
         grad_output_t = grad_output_t.reshape(-1, grad_output_t.shape[-1]).contiguous()
         B, N = grad_output_t.shape
@@ -81,6 +84,8 @@ class SparseLinearFunction(torch.autograd.Function):
                 input_flat, W_idx_N, W_idx_M, W_val, grad_output, grad_input, grad_W_val
             )
         else:
+            if ctx.jit.options.reg_tiling:
+                W_val = W_val[jit_recreate_idx[0]]
             ctx.jit.call_backward(
                 B,
                 input_flat.shape[0],
@@ -94,6 +99,8 @@ class SparseLinearFunction(torch.autograd.Function):
                 grad_input.data_ptr(),
                 grad_W_val.data_ptr()
             )
+            if ctx.jit.options.reg_tiling:
+                grad_W_val = grad_W_val[jit_recreate_idx[1]]
 
         M = input_flat.shape[0]
         if B % TRANSPOSE_BLOCK_SIZE == 0 and M % TRANSPOSE_BLOCK_SIZE == 0:
@@ -108,7 +115,7 @@ class SparseLinearFunction(torch.autograd.Function):
             grad_bias = grad_output_t.sum(
                 [i for i in range(len(grad_output_t.shape) - 1)]
             )
-        return grad_input_t, grad_W_val, None, grad_bias, None, None
+        return grad_input_t, grad_W_val, None, grad_bias, None, None, None
 
 
 class SparseConvFunction(torch.autograd.Function):

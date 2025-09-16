@@ -1,9 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor, wait
+import itertools
 from threading import Thread
 
 import ctypes
 import time
+import pulp
 from llvmlite import ir, binding
+import torch
 
 from sparseprop.modules.jit_utils import JITOptions
 
@@ -16,6 +19,7 @@ class LinearJIT:
         W_idx,
         W_shape,
         jit_options=JITOptions(),
+        reg_tile_ops=None,
         name="jit_sparse_linear_forward",
     ):
         self.options = jit_options
@@ -25,14 +29,18 @@ class LinearJIT:
         self.W_idx_N, self.W_idx_M = W_idx
         self.N = W_shape[0]
         self.M = W_shape[1]
-        self.codelets, self.trace, self.non_strided_N = self.find_strides(
-            self.N, self.W_idx_N, self.W_idx_M
-        )
+        if self.options.psc:
+            self.codelets, self.trace, self.non_strided_N = self.find_strides(
+                self.N, self.W_idx_N, self.W_idx_M
+            )
 
         self.fn_fwd = None
         self.fn_bwd = None
 
         self.back_jit_thread = None
+
+        if self.options.reg_tiling:
+            self.reg_tile_groups, self.W_reg_offset = reg_tile_ops
 
         # Initialize LLVM
         binding.initialize()
@@ -96,7 +104,7 @@ class LinearJIT:
         )
         self.printf = ir.Function(self.module, printf_ty, name="printf")
 
-        fmt_str = "%d\n\0"
+        fmt_str = "%d %d\n\0"
         fmt_bytes = bytearray(fmt_str.encode("utf8"))
         fmt_type = ir.ArrayType(ir.IntType(8), len(fmt_bytes))
 
@@ -106,6 +114,7 @@ class LinearJIT:
         ############# Printf
 
     def find_strides(self, n, row_idx, col_idx):
+        assert self.options.psc, "PSC option needs to be provided!"
         trace = []
         for i in range(n):
             k = range(row_idx[i], row_idx[i + 1])
@@ -183,6 +192,183 @@ class LinearJIT:
             codelets,
             orig_trace,
             [sorted_indices[i] for i, val in enumerate(visited) if not val],
+        )
+
+    @staticmethod
+    def find_enum_freq(W_dense, t_i):
+        n, m = W_dense.shape
+        enum_freq = [0] * (2**t_i)
+        enum_assignment = []
+        for i in range(0, n - t_i + 1, t_i):
+            enum_assignment.append([])
+            for j in range(0, m):
+                index = 0
+                for k in range(0, t_i):
+                    index <<= 1
+                    if W_dense[i + k][j]:
+                        index += 1
+                enum_freq[index] += 1
+                enum_assignment[-1].append(index)
+        return enum_freq, enum_assignment
+
+    @staticmethod
+    def powerset(iterable):
+        s = list(iterable)
+        return list(
+            itertools.chain.from_iterable(
+                itertools.combinations(s, r) for r in range(len(s) + 1)
+            )
+        )
+
+    @staticmethod
+    def get_group_cost(indices):
+        VAR_COST = 1  # Cost of loads of A and fma
+        BASE_COST = 2  # cost of loads of B
+        idx = 0
+        for i in indices:
+            idx |= i
+        unique_nnz = bin(idx).count("1")
+        return unique_nnz * VAR_COST + BASE_COST
+
+    @staticmethod
+    def solve_set_cover_pulp(
+        elements_to_cover: set,
+        available_subsets: list,
+        subset_costs: list,
+        max_num_subset: int = None,
+        force_num_subsets: bool = False,
+    ):
+        num_subsets = len(available_subsets)
+
+        prob = pulp.LpProblem("SetCoverProblem", pulp.LpMinimize)
+
+        x = pulp.LpVariable.dicts(
+            name="subset", indices=range(num_subsets), cat=pulp.LpBinary
+        )
+
+        prob += (
+            pulp.lpSum([subset_costs[i] * x[i] for i in range(num_subsets)]),
+            "Total_Cost",
+        )
+
+        for element in elements_to_cover:
+            covering_subsets = [
+                x[i] for i, subset in enumerate(available_subsets) if element in subset
+            ]
+
+            if covering_subsets:
+                prob += pulp.lpSum(covering_subsets) == 1, f"CoverElement_{element}"
+
+        if max_num_subset is not None:
+            total_subsets_chosen = pulp.lpSum([x[i] for i in range(num_subsets)])
+            if force_num_subsets:
+                prob += (
+                    total_subsets_chosen == max_num_subset,
+                    "Force_Exact_Number_of_Subsets",
+                )
+            else:
+                prob += total_subsets_chosen <= max_num_subset, "Max_Number_of_Subsets"
+
+        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+        if pulp.LpStatus[prob.status] == "Optimal":
+            chosen_indices = [i for i in range(num_subsets) if x[i].varValue > 0.9]
+            chosen_subsets = [available_subsets[i] for i in chosen_indices]
+            return chosen_subsets
+        else:
+            print(
+                f"Could not find an optimal solution. Status: {pulp.LpStatus[prob.status]}"
+            )
+            return None
+
+    @staticmethod
+    def solve_sparse_jam(W_dense, row_tile):
+        OVERHEAD = 0.7
+        enum_freq, enum_assignment = LinearJIT.find_enum_freq(W_dense, row_tile)
+        to_cover = {i for i, freq in enumerate(enum_freq) if freq > 0}
+        all_sets = LinearJIT.powerset(range(1, len(enum_freq)))
+        all_costs = [0] * len(all_sets)
+        for i, g in enumerate(all_sets):
+            freq = 0
+            for idx in g:
+                freq += enum_freq[idx]
+            all_costs[i] = LinearJIT.get_group_cost(g) * freq + OVERHEAD
+
+        included_groups = LinearJIT.solve_set_cover_pulp(
+            to_cover, all_sets, all_costs, max_num_subset=5
+        )
+        column_vals = []
+        column_pointers = []
+        for i, assignments in enumerate(enum_assignment):
+            mapping_dict = {}
+            for j, idx in enumerate(assignments):
+                if idx not in mapping_dict:
+                    mapping_dict[idx] = []
+                mapping_dict[idx].append(j)
+
+            # Look at groups now:
+            column_pointers.append([len(column_vals)])
+            for g in included_groups:
+                for idx in g:
+                    if idx in mapping_dict:
+                        column_vals += mapping_dict[idx]
+                column_pointers[i].append(len(column_vals))
+        tile_groups = [[] for _ in range(len(included_groups))]
+        for i, g in enumerate(included_groups):
+            idx = 0
+            for j in g:
+                idx |= j
+            bin_str = bin(idx)[2:]
+            bin_str = (row_tile - len(bin_str)) * "0" + bin_str
+            tile_groups[i] = [j for j, bit in enumerate(bin_str) if bit == "1"]
+        # Also get W_val
+        # Also, get W_idx_N, W_idx_M to recreate later
+        W_val = []
+        to_dense_idx = {}
+        W_idx_N, W_idx_M = [0], []
+        recreate_idx = [[] for _ in range(len(W_dense))]
+        W_indices = [[] for _ in range(len(W_dense))]
+        for i, ptr in enumerate(column_pointers):
+            for j in range(len(tile_groups)):
+                for idx in range(ptr[j], ptr[j + 1]):
+                    for i_idx in tile_groups[j]:
+                        row_idx = i * row_tile + i_idx
+                        col_idx = column_vals[idx]
+                        W_indices[row_idx].append(col_idx)
+                        recreate_idx[row_idx].append(len(W_val))
+                        W_val.append(W_dense[row_idx][col_idx])
+                        if W_val[-1]:
+                            to_dense_idx[(row_idx, col_idx)] = len(W_val) - 1
+        recreate_idx_from = [item for row in recreate_idx for item in row]
+        recreate_idx_back = [0] * len(recreate_idx_from)
+        for i, idx in enumerate(recreate_idx_from):
+            recreate_idx_back[idx] = i
+        for cols in W_indices:
+            for i in cols:
+                W_idx_M.append(i)
+            W_idx_N.append(len(W_idx_M))
+        # For parallel execution, we need to know the exact offset for W_val
+        W_offset = [0]
+        for ptr in column_pointers:
+            acc = W_offset[-1]
+            for i in range(len(ptr) - 1):
+                acc += (ptr[i + 1] - ptr[i]) * len(tile_groups[i])
+            W_offset.append(acc)
+        # print(tile_groups, len(W_val), "\n", column_pointers, "\n", column_vals)
+        return (
+            (tile_groups, W_offset),
+            torch.Tensor(W_val),
+            (torch.Tensor(column_pointers).int(), torch.Tensor(column_vals).int()),
+            (
+                torch.Tensor(W_idx_N).int(),
+                torch.Tensor(W_idx_M).int(),
+                (
+                    # To switch from and back to the special reg tile representation
+                    torch.Tensor(recreate_idx_from).int(),
+                    torch.Tensor(recreate_idx_back).int(),
+                ),
+            ),
+            to_dense_idx,
         )
 
     def gen_fwd_codelet(
@@ -515,6 +701,168 @@ class LinearJIT:
             builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
             builder.branch(batch_loop)
 
+    def _jit_forward_reg_tiled(
+        self,
+        builder,
+        pstart,
+        pend,
+        B,
+        M,
+        N,
+        W_nnz,
+        X,
+        col_ptr,
+        col_idx,
+        W_val,
+        O,
+        w_offset,
+    ):
+        t_i = ir.Constant(ir.IntType(32), self.options.reg_tile_size[0])
+        t_j = ir.Constant(ir.IntType(32), self.options.reg_tile_size[1])
+
+        i = builder.alloca(ir.IntType(32), name="i")
+        builder.store(builder.mul(pstart, t_i), i)  # pstart * tile_size
+
+        w_cnt = builder.alloca(ir.IntType(32), name="w_cnt")
+        curr = builder.alloca(ir.IntType(32), name="curr")
+        builder.store(w_offset, curr)
+        next = builder.alloca(ir.IntType(32), name="next")
+
+        N_loop = builder.append_basic_block("N_loop")
+        builder.branch(N_loop)
+        builder.position_at_start(N_loop)
+
+        i_val = builder.load(i)
+
+        cond = builder.icmp_signed(
+            "<", i_val, builder.mul(pend, t_i)
+        )  # pend * tile_size
+        with builder.if_then(cond):
+            j = builder.alloca(ir.IntType(32), name="j")
+            builder.store(ir.Constant(ir.IntType(32), 0), j)
+
+            batch_loop = builder.append_basic_block("B_loop")
+            builder.branch(batch_loop)
+            builder.position_at_start(batch_loop)
+
+            j_val = builder.load(j)
+
+            cond = builder.icmp_signed("<", j_val, B)
+            with builder.if_then(cond):
+                builder.store(builder.load(curr), w_cnt)
+                out_indices = [
+                    builder.add(
+                        builder.mul(
+                            builder.add(i_val, ir.Constant(ir.IntType(32), i_idx)), B
+                        ),
+                        builder.add(j_val, ir.Constant(ir.IntType(32), j_idx)),
+                    )
+                    for i_idx in range(self.options.reg_tile_size[0])
+                    for j_idx in range(self.options.reg_tile_size[1])
+                ]
+                out = [builder.alloca(ir.FloatType()) for _ in out_indices]
+                for o_idx, idx in enumerate(out_indices):
+                    builder.store(builder.load(builder.gep(O, [idx])), out[o_idx])
+
+                for cnt, g in enumerate(self.reg_tile_groups):
+                    p = builder.alloca(ir.IntType(32))
+                    idx_part = builder.mul(
+                        builder.sdiv(i_val, t_i),
+                        ir.Constant(ir.IntType(32), len(self.reg_tile_groups) + 1),
+                    )
+                    col_ptr_start = builder.load(
+                        builder.gep(
+                            col_ptr,
+                            [builder.add(idx_part, ir.Constant(ir.IntType(32), cnt))],
+                        )
+                    )
+                    col_ptr_end = builder.load(
+                        builder.gep(
+                            col_ptr,
+                            [
+                                builder.add(
+                                    idx_part, ir.Constant(ir.IntType(32), cnt + 1)
+                                )
+                            ],
+                        )
+                    )
+                    builder.store(col_ptr_start, p)
+
+                    tile_loop = builder.append_basic_block("tile_loop")
+                    builder.branch(tile_loop)
+                    builder.position_at_start(tile_loop)
+
+                    p_val = builder.load(p)
+                    cond = builder.icmp_signed("<", p_val, col_ptr_end)
+                    with builder.if_then(cond):
+                        k_val = builder.load(builder.gep(col_idx, [p_val]))
+                        for i_offset in g:
+                            for j_offset in range(self.options.reg_tile_size[1]):
+                                x_idx = builder.add(
+                                    builder.mul(k_val, B),
+                                    builder.add(
+                                        j_val,
+                                        ir.Constant(ir.IntType(32), j_offset),
+                                    ),
+                                )
+                                x = builder.gep(X, [x_idx])
+                                fma = builder.call(
+                                    self.fma_float,
+                                    [
+                                        builder.load(x),
+                                        builder.load(
+                                            builder.gep(
+                                                W_val,
+                                                [builder.load(w_cnt)],
+                                            )
+                                        ),
+                                        builder.load(
+                                            out[
+                                                i_offset * self.options.reg_tile_size[1]
+                                                + j_offset
+                                            ]
+                                        ),
+                                    ],
+                                )
+                                builder.store(
+                                    fma,
+                                    out[
+                                        i_offset * self.options.reg_tile_size[1]
+                                        + j_offset
+                                    ],
+                                )
+
+                            builder.store(
+                                builder.add(
+                                    builder.load(w_cnt), ir.Constant(ir.IntType(32), 1)
+                                ),
+                                w_cnt,
+                            )
+                            # builder.call(
+                            #     self.printf,
+                            #     [
+                            #         builder.bitcast(
+                            #             self.global_fmt, ir.IntType(8).as_pointer()
+                            #         ),
+                            #         builder.load(w_cnt),
+                            #     ],
+                            # )
+                        builder.store(
+                            builder.add(p_val, ir.Constant(ir.IntType(32), 1)), p
+                        )
+                        builder.branch(tile_loop)
+
+                for o_idx, idx in enumerate(out_indices):
+                    builder.store(builder.load(out[o_idx]), builder.gep(O, [idx]))
+
+                builder.store(builder.load(w_cnt), next)
+                builder.store(builder.add(j_val, t_j), j)
+                builder.branch(batch_loop)
+
+            builder.store(builder.load(next), curr)
+            builder.store(builder.add(i_val, t_i), i)
+            builder.branch(N_loop)
+
     def _jit_backward_psc(
         self,
         builder,
@@ -765,37 +1113,39 @@ class LinearJIT:
         float_ptr_ty = ir.PointerType(ir.FloatType())
         int_ptr_ty = ir.PointerType(ir.IntType(32))
         int_ty = ir.IntType(32)
-        func_ty = ir.FunctionType(
-            ir.VoidType(),
-            [
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                int_ty,
-                float_ptr_ty,
-                int_ptr_ty,
-                int_ptr_ty,
-                float_ptr_ty,
-                float_ptr_ty,
-            ],
-        )
+        func_args = [
+            int_ty,
+            int_ty,
+            int_ty,
+            int_ty,
+            int_ty,
+            int_ty,
+            float_ptr_ty,
+            int_ptr_ty,
+            int_ptr_ty,
+            float_ptr_ty,
+            float_ptr_ty,
+        ]
+        if self.options.reg_tiling:
+            func_args.append(int_ty)
+        func_ty = ir.FunctionType(ir.VoidType(), func_args)
 
         func = ir.Function(self.module, func_ty, name=fn_name)
 
         block = func.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
 
-        # if self.options.unrolled_scalar:
-        #     self._jit_forward_unrolled_vector(builder, *func.args)
-        # else:
-        #     self._jit_forward_vec(builder, *func.args)
-        self._jit_forward_psc(builder, *func.args)
+        if self.options.unrolled_scalar:
+            self._jit_forward_unrolled_vector(builder, *func.args)
+        elif self.options.reg_tiling:
+            self._jit_forward_reg_tiled(builder, *func.args)
+        elif self.options.psc:
+            self._jit_forward_psc(builder, *func.args)
+        else:
+            self._jit_forward_vec(builder, *func.args)
         builder.ret_void()
 
         llvm_ir = str(self.module)
-
         mod = binding.parse_assembly(llvm_ir)
         LinearJIT.optimize(mod, self.target_machine)
 
@@ -804,7 +1154,7 @@ class LinearJIT:
 
         fn_ptr = self.engine.get_function_address(fn_name)
 
-        self.fn_fwd = ctypes.CFUNCTYPE(
+        func_ctype_args = [
             None,
             ctypes.c_int,
             ctypes.c_int,
@@ -817,7 +1167,10 @@ class LinearJIT:
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_float),
-        )(fn_ptr)
+        ]
+        if self.options.reg_tiling:
+            func_ctype_args.append(ctypes.c_int)
+        self.fn_fwd = ctypes.CFUNCTYPE(*func_ctype_args)(fn_ptr)
 
         ctypes.CDLL(None)
 
@@ -1072,8 +1425,12 @@ class LinearJIT:
         block = func.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
 
-        # self._jit_backward_vec(builder, *func.args)
-        self._jit_backward_psc(builder, *func.args)
+        if self.options.psc:
+            self._jit_backward_psc(builder, *func.args)
+        else:
+            # Backward with register tilling is inefficient as we compute over the zero elements of W
+            # We probably don't want this and need to change the staorage format of X...
+            self._jit_backward_vec(builder, *func.args)
         builder.ret_void()
 
         llvm_ir = str(self.module)
@@ -1111,20 +1468,21 @@ class LinearJIT:
             return
 
         chunk_size = (loop_size + num_threads - 1) // num_threads
-
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = []
             for i in range(num_threads):
                 start = i * chunk_size
                 end = min(start + chunk_size, loop_size)
                 futures.append(executor.submit(worker, start, end))
-
             wait(futures)
 
     def call_forward(
         self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output, num_threads=4
     ):
         def worker(start, end):
+            w_offset = None
+            if self.options.reg_tiling:
+                w_offset = self.W_reg_offset[start]
             self.fn_fwd(
                 start,
                 end,
@@ -1137,6 +1495,7 @@ class LinearJIT:
                 ctypes.cast(W_idx_M, ctypes.POINTER(ctypes.c_int)),
                 ctypes.cast(W_val, ctypes.POINTER(ctypes.c_float)),
                 ctypes.cast(output, ctypes.POINTER(ctypes.c_float)),
+                w_offset,
             )
 
         # start = time.time()
@@ -1147,8 +1506,14 @@ class LinearJIT:
             #     self.back_jit_thread.start()
             self._jit_forward()
         # print("Jit time (approx):", time.time() - start)
-
-        self._call(worker, B if self.options.unrolled_scalar else N, num_threads)
+        if self.options.unrolled_scalar:
+            loop_size = B
+        elif self.options.reg_tiling:
+            # We multiply later to recover this if not parallel
+            loop_size = N // self.options.reg_tile_size[0]
+        else:
+            loop_size = N
+        self._call(worker, loop_size, num_threads)
 
     def call_backward(
         self,
