@@ -19,6 +19,8 @@ class JITOptions:
         assert (do_psc + do_reg_tiling + do_only_scalar) <= 1, (
             "Usage of any of these two (or more versions) is not supported."
         )
+        if reg_tile_size:
+            assert not (reg_tile_size[1] & (reg_tile_size[1] - 1)), "Column tile size should always be a power of 2!"
         self.batch_size = batch
         self.unroll = do_unroll
         self.parallel = do_parallel

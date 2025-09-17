@@ -11,7 +11,7 @@ import torch
 from sparseprop.modules.jit_utils import JITOptions
 
 
-# Batch size should be multiples of 8
+# Batch size should be multiples of 8!!!!!! ALWAYS
 class LinearJIT:
     def __init__(
         self,
@@ -40,6 +40,11 @@ class LinearJIT:
         self.back_jit_thread = None
 
         if self.options.reg_tiling:
+            # Should assert for batch too but we possibly don't know that yet...
+            assert not self.N % self.options.reg_tile_size[0]
+            (
+                "Tile size must be divisible by output dim! We don't support residual calculations!"
+            )
             self.reg_tile_groups, self.W_reg_offset = reg_tile_ops
 
         # Initialize LLVM
@@ -701,6 +706,76 @@ class LinearJIT:
             builder.store(builder.add(j_val, ir.Constant(ir.IntType(32), 1)), j)
             builder.branch(batch_loop)
 
+    def fwd_reg_tile_load_out(self, builder, B, i_val, j_val, O, isVec):
+        step = 8 if isVec else 1
+        out_indices = [
+            builder.add(
+                builder.mul(builder.add(i_val, ir.Constant(ir.IntType(32), i_idx)), B),
+                builder.add(j_val, ir.Constant(ir.IntType(32), j_idx)),
+            )
+            for i_idx in range(self.options.reg_tile_size[0])
+            for j_idx in range(0, self.options.reg_tile_size[1], step)
+        ]
+        if isVec:
+            out = [self.vec_load_arr(builder, O, idx) for idx in out_indices]
+        else:
+            out = [builder.alloca(ir.FloatType()) for _ in out_indices]
+            for o_idx, idx in enumerate(out_indices):
+                builder.store(builder.load(builder.gep(O, [idx])), out[o_idx])
+        return out_indices, out
+
+    def fwd_reg_tile_store_out(self, builder, O, out_indices, out, isVec):
+        if isVec:
+            for o_idx, idx in enumerate(out_indices):
+                builder.store(
+                    builder.load(out[o_idx]),
+                    builder.bitcast(
+                        builder.gep(O, [idx]),
+                        ir.PointerType(ir.VectorType(ir.FloatType(), 8)),
+                    ),
+                )
+        else:
+            for o_idx, idx in enumerate(out_indices):
+                builder.store(builder.load(out[o_idx]), builder.gep(O, [idx]))
+
+    def fwd_reg_tile_inner_loop(
+        self, builder, g, B, W_val, X, j_val, k_val, w_cnt, out, isVec
+    ):
+        step = 8 if isVec else 1
+        w_vec = builder.alloca(ir.VectorType(ir.FloatType(), 8), name="v")
+        for i_offset in g:
+            for j_offset in range(0, self.options.reg_tile_size[1], step):
+                x_idx = builder.add(
+                    builder.mul(k_val, B),
+                    builder.add(
+                        j_val,
+                        ir.Constant(ir.IntType(32), j_offset),
+                    ),
+                )
+                w = builder.gep(W_val, [builder.load(w_cnt)])
+                out_ptr = out[
+                    i_offset * (self.options.reg_tile_size[1] // step)
+                    + (j_offset // step)
+                ]
+                if isVec:
+                    LinearJIT.vec_set(builder, w_vec, builder.load(w))
+                    x = LinearJIT.vec_load_arr(builder, X, x_idx)
+                    fma = builder.call(
+                        self.fma_intr,
+                        [builder.load(x), builder.load(w_vec), builder.load(out_ptr)],
+                    )
+                else:
+                    x = builder.gep(X, [x_idx])
+                    fma = builder.call(
+                        self.fma_float,
+                        [builder.load(x), builder.load(w), builder.load(out_ptr)],
+                    )
+                builder.store(fma, out_ptr)
+            builder.store(
+                builder.add(builder.load(w_cnt), ir.Constant(ir.IntType(32), 1)),
+                w_cnt,
+            )
+
     def _jit_forward_reg_tiled(
         self,
         builder,
@@ -719,6 +794,8 @@ class LinearJIT:
     ):
         t_i = ir.Constant(ir.IntType(32), self.options.reg_tile_size[0])
         t_j = ir.Constant(ir.IntType(32), self.options.reg_tile_size[1])
+        # Right now we only vectorize if column tile size is an exact multiple of 8, no residuals.
+        isVec = not self.options.reg_tile_size[1] % 8
 
         i = builder.alloca(ir.IntType(32), name="i")
         builder.store(builder.mul(pstart, t_i), i)  # pstart * tile_size
@@ -750,19 +827,9 @@ class LinearJIT:
             cond = builder.icmp_signed("<", j_val, B)
             with builder.if_then(cond):
                 builder.store(builder.load(curr), w_cnt)
-                out_indices = [
-                    builder.add(
-                        builder.mul(
-                            builder.add(i_val, ir.Constant(ir.IntType(32), i_idx)), B
-                        ),
-                        builder.add(j_val, ir.Constant(ir.IntType(32), j_idx)),
-                    )
-                    for i_idx in range(self.options.reg_tile_size[0])
-                    for j_idx in range(self.options.reg_tile_size[1])
-                ]
-                out = [builder.alloca(ir.FloatType()) for _ in out_indices]
-                for o_idx, idx in enumerate(out_indices):
-                    builder.store(builder.load(builder.gep(O, [idx])), out[o_idx])
+                out_indices, out = self.fwd_reg_tile_load_out(
+                    builder, B, i_val, j_val, O, isVec
+                )
 
                 for cnt, g in enumerate(self.reg_tile_groups):
                     p = builder.alloca(ir.IntType(32))
@@ -796,64 +863,24 @@ class LinearJIT:
                     cond = builder.icmp_signed("<", p_val, col_ptr_end)
                     with builder.if_then(cond):
                         k_val = builder.load(builder.gep(col_idx, [p_val]))
-                        for i_offset in g:
-                            for j_offset in range(self.options.reg_tile_size[1]):
-                                x_idx = builder.add(
-                                    builder.mul(k_val, B),
-                                    builder.add(
-                                        j_val,
-                                        ir.Constant(ir.IntType(32), j_offset),
-                                    ),
-                                )
-                                x = builder.gep(X, [x_idx])
-                                fma = builder.call(
-                                    self.fma_float,
-                                    [
-                                        builder.load(x),
-                                        builder.load(
-                                            builder.gep(
-                                                W_val,
-                                                [builder.load(w_cnt)],
-                                            )
-                                        ),
-                                        builder.load(
-                                            out[
-                                                i_offset * self.options.reg_tile_size[1]
-                                                + j_offset
-                                            ]
-                                        ),
-                                    ],
-                                )
-                                builder.store(
-                                    fma,
-                                    out[
-                                        i_offset * self.options.reg_tile_size[1]
-                                        + j_offset
-                                    ],
-                                )
-
-                            builder.store(
-                                builder.add(
-                                    builder.load(w_cnt), ir.Constant(ir.IntType(32), 1)
-                                ),
-                                w_cnt,
-                            )
-                            # builder.call(
-                            #     self.printf,
-                            #     [
-                            #         builder.bitcast(
-                            #             self.global_fmt, ir.IntType(8).as_pointer()
-                            #         ),
-                            #         builder.load(w_cnt),
-                            #     ],
-                            # )
+                        self.fwd_reg_tile_inner_loop(
+                            builder, g, B, W_val, X, j_val, k_val, w_cnt, out, isVec
+                        )
+                        # builder.call(
+                        #     self.printf,
+                        #     [
+                        #         builder.bitcast(
+                        #             self.global_fmt, ir.IntType(8).as_pointer()
+                        #         ),
+                        #         builder.load(w_cnt),
+                        #     ],
+                        # )
                         builder.store(
                             builder.add(p_val, ir.Constant(ir.IntType(32), 1)), p
                         )
                         builder.branch(tile_loop)
 
-                for o_idx, idx in enumerate(out_indices):
-                    builder.store(builder.load(out[o_idx]), builder.gep(O, [idx]))
+                self.fwd_reg_tile_store_out(builder, O, out_indices, out, isVec)
 
                 builder.store(builder.load(w_cnt), next)
                 builder.store(builder.add(j_val, t_j), j)
