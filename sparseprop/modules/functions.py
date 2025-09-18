@@ -38,11 +38,11 @@ class SparseLinearFunction(torch.autograd.Function):
                 M,
                 N,
                 W_val.shape[0],
-                jit_input.data_ptr(),
-                W_idx_N.data_ptr(),
-                W_idx_M.data_ptr(),
-                W_val.data_ptr(),
-                output.data_ptr(),
+                jit_input,
+                W_idx_N,
+                W_idx_M,
+                W_val,
+                output,
             )
 
         ctx.jit = jit
@@ -91,13 +91,13 @@ class SparseLinearFunction(torch.autograd.Function):
                 input_flat.shape[0],
                 N,
                 W_val.shape[0],
-                input_flat.data_ptr(),
-                W_idx_N.data_ptr(),
-                W_idx_M.data_ptr(),
-                W_val.data_ptr(),
-                grad_output.data_ptr(),
-                grad_input.data_ptr(),
-                grad_W_val.data_ptr()
+                input_flat,
+                W_idx_N,
+                W_idx_M,
+                W_val,
+                grad_output,
+                grad_input,
+                grad_W_val
             )
             if ctx.jit.options.reg_tiling:
                 grad_W_val = grad_W_val[jit_recreate_idx[1]]

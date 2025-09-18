@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ProcessPoolExecutor, wait
 import itertools
 from threading import Thread
 
@@ -1179,26 +1179,7 @@ class LinearJIT:
         self.engine.add_module(mod)
         self.engine.finalize_object()
 
-        fn_ptr = self.engine.get_function_address(fn_name)
-
-        func_ctype_args = [
-            None,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-        ]
-        if self.options.reg_tiling:
-            func_ctype_args.append(ctypes.c_int)
-        self.fn_fwd = ctypes.CFUNCTYPE(*func_ctype_args)(fn_ptr)
-
+        self.fn_fwd = self.engine.get_function_address(fn_name)
         ctypes.CDLL(None)
 
     def bck_fma(self, builder, dLdX, x_idx, X, dLdO, O_idx, v, acc):
@@ -1468,9 +1449,126 @@ class LinearJIT:
         self.engine.add_module(mod)
         self.engine.finalize_object()
 
-        fn_ptr = self.engine.get_function_address(fn_name)
+        self.fn_bwd = self.engine.get_function_address(fn_name)
+        ctypes.CDLL(None)
 
-        self.fn_bwd = ctypes.CFUNCTYPE(
+    def _call(self, worker, args, loop_size, num_threads):
+        if not self.options.parallel:
+            worker(0, loop_size, *args)
+            return
+
+        chunk_size = (loop_size + num_threads - 1) // num_threads
+        with ProcessPoolExecutor(max_workers=num_threads) as executor:
+            futures = []
+            for i in range(num_threads):
+                start = i * chunk_size
+                end = min(start + chunk_size, loop_size)
+                futures.append(executor.submit(worker, start, end, *args))
+            wait(futures)
+
+    @staticmethod
+    def _forward(
+        start,
+        end,
+        options,
+        W_reg_offset,
+        fn_fwd,
+        B,
+        M,
+        N,
+        W_nnz,
+        X,
+        W_idx_N,
+        W_idx_M,
+        W_val,
+        output,
+    ):
+        func_ctype_args = [
+            None,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        w_offset = None
+        if options.reg_tiling:
+            w_offset = W_reg_offset[start]
+            func_ctype_args.append(ctypes.c_int)
+        fn_fwd = ctypes.CFUNCTYPE(*func_ctype_args)(fn_fwd)
+        fn_fwd(
+            start,
+            end,
+            B,
+            M,
+            N,
+            W_nnz,
+            ctypes.cast(X.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(W_idx_N.data_ptr(), ctypes.POINTER(ctypes.c_int)),
+            ctypes.cast(W_idx_M.data_ptr(), ctypes.POINTER(ctypes.c_int)),
+            ctypes.cast(W_val.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(output.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            w_offset,
+        )
+
+    def call_forward(
+        self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output, num_threads=4
+    ):
+        start = time.time()
+        if not self.fn_fwd:
+            self._jit_forward()
+        print("Jit time (approx):", time.time() - start)
+
+        if self.options.unrolled_scalar:
+            loop_size = B
+        elif self.options.reg_tiling:
+            # We multiply later to recover this if not parallel
+            loop_size = N // self.options.reg_tile_size[0]
+        else:
+            loop_size = N
+
+        args = [
+            self.options,
+            self.W_reg_offset,
+            self.fn_fwd,
+            B,
+            M,
+            N,
+            W_nnz,
+            X,
+            W_idx_N,
+            W_idx_M,
+            W_val,
+            output,
+        ]
+        start = time.time()
+        self._call(LinearJIT._forward, args, loop_size, num_threads)
+        print("Jit FWD time (approx):", time.time() - start)
+
+    @staticmethod
+    def _backward(
+        start,
+        end,
+        fn_bwd,
+        B,
+        M,
+        N,
+        W_nnz,
+        X,
+        W_idx_N,
+        W_idx_M,
+        W_val,
+        dLdO,
+        dLdX,
+        dLdW_val,
+    ):
+        fn_bwd = ctypes.CFUNCTYPE(
             None,
             ctypes.c_int,
             ctypes.c_int,
@@ -1485,62 +1583,22 @@ class LinearJIT:
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_float),
-        )(fn_ptr)
-
-        ctypes.CDLL(None)
-
-    def _call(self, worker, loop_size, num_threads):
-        if not self.options.parallel:
-            worker(0, loop_size)
-            return
-
-        chunk_size = (loop_size + num_threads - 1) // num_threads
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = []
-            for i in range(num_threads):
-                start = i * chunk_size
-                end = min(start + chunk_size, loop_size)
-                futures.append(executor.submit(worker, start, end))
-            wait(futures)
-
-    def call_forward(
-        self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output, num_threads=4
-    ):
-        def worker(start, end):
-            w_offset = None
-            if self.options.reg_tiling:
-                w_offset = self.W_reg_offset[start]
-            self.fn_fwd(
-                start,
-                end,
-                B,
-                M,
-                N,
-                W_nnz,
-                ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
-                ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
-                ctypes.cast(W_idx_M, ctypes.POINTER(ctypes.c_int)),
-                ctypes.cast(W_val, ctypes.POINTER(ctypes.c_float)),
-                ctypes.cast(output, ctypes.POINTER(ctypes.c_float)),
-                w_offset,
-            )
-
-        # start = time.time()
-        if not self.fn_fwd:
-            # Also spin up the backward jit-er
-            # if not self.fn_bwd:
-            #     self.back_jit_thread = Thread(target=self._jit_backward)
-            #     self.back_jit_thread.start()
-            self._jit_forward()
-        # print("Jit time (approx):", time.time() - start)
-        if self.options.unrolled_scalar:
-            loop_size = B
-        elif self.options.reg_tiling:
-            # We multiply later to recover this if not parallel
-            loop_size = N // self.options.reg_tile_size[0]
-        else:
-            loop_size = N
-        self._call(worker, loop_size, num_threads)
+        )(fn_bwd)
+        fn_bwd(
+            start,
+            end,
+            B,
+            M,
+            N,
+            W_nnz,
+            ctypes.cast(X.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(W_idx_N.data_ptr(), ctypes.POINTER(ctypes.c_int)),
+            ctypes.cast(W_idx_M.data_ptr(), ctypes.POINTER(ctypes.c_int)),
+            ctypes.cast(W_val.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(dLdO.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(dLdX.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(dLdW_val.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        )
 
     def call_backward(
         self,
@@ -1557,25 +1615,26 @@ class LinearJIT:
         dLdW_val,
         num_threads=4,
     ):
-        def worker(start, end):
-            self.fn_bwd(
-                start,
-                end,
-                B,
-                M,
-                N,
-                W_nnz,
-                ctypes.cast(X, ctypes.POINTER(ctypes.c_float)),
-                ctypes.cast(W_idx_N, ctypes.POINTER(ctypes.c_int)),
-                ctypes.cast(W_idx_M, ctypes.POINTER(ctypes.c_int)),
-                ctypes.cast(W_val, ctypes.POINTER(ctypes.c_float)),
-                ctypes.cast(dLdO, ctypes.POINTER(ctypes.c_float)),
-                ctypes.cast(dLdX, ctypes.POINTER(ctypes.c_float)),
-                ctypes.cast(dLdW_val, ctypes.POINTER(ctypes.c_float)),
-            )
-
         if not self.fn_bwd:
-            # self.back_jit_thread.join()
             self._jit_backward()
 
-        self._call(worker, B if self.options.unrolled_scalar else N, num_threads)
+        args = [
+            self.fn_bwd,
+            B,
+            M,
+            N,
+            W_nnz,
+            X,
+            W_idx_N,
+            W_idx_M,
+            W_val,
+            dLdO,
+            dLdX,
+            dLdW_val,
+        ]
+        self._call(
+            LinearJIT._backward,
+            args,
+            B if self.options.unrolled_scalar else N,
+            num_threads,
+        )
