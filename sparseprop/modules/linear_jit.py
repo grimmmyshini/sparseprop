@@ -12,6 +12,7 @@ from numba import njit, prange, extending
 
 from sparseprop.modules.jit_utils import JITOptions
 
+
 @extending.intrinsic
 def address_as_float_pointer(typingctx, src):
     """returns a void pointer from a given memory address"""
@@ -48,6 +49,8 @@ class LinearJIT:
         jit_options=JITOptions(),
         reg_tile_ops=None,
         name="jit_sparse_linear_forward",
+        B=None,
+        immediate_jit=True,
     ):
         self.options = jit_options
         self.unroll_times = jit_options.batch_size // 8
@@ -145,6 +148,14 @@ class LinearJIT:
         self.global_fmt.initializer = ir.Constant(fmt_type, fmt_bytes)
         ############# Printf
 
+        if B and self.options.unroll:
+            self.add_unrolling(B)
+
+        # JIT at the start
+        if immediate_jit:
+            self._jit_forward()
+            self._jit_backward()
+
     def find_strides(self, n, row_idx, col_idx):
         assert self.options.psc, "PSC option needs to be provided!"
         trace = []
@@ -217,7 +228,6 @@ class LinearJIT:
                         scale = None
                 i += 1
             if codelet:
-                print(codelet)
                 codelets.append(codelet)
             k += 1
         return (
@@ -327,7 +337,7 @@ class LinearJIT:
             all_costs[i] = LinearJIT.get_group_cost(g) * freq + OVERHEAD
 
         included_groups = LinearJIT.solve_set_cover_pulp(
-            to_cover, all_sets, all_costs, max_num_subset=5
+            to_cover, all_sets, all_costs, max_num_subset=20
         )
         column_vals = []
         column_pointers = []
@@ -583,12 +593,23 @@ class LinearJIT:
         builder.store(set, vec)
 
     @staticmethod
-    def optimize(module, target_machine):
-        pb = binding.PassBuilder(
-            target_machine, binding.PipelineTuningOptions(speed_level=3, size_level=0)
-        )
-        pm = pb.getModulePassManager()
-        pm.run(module, pb)
+    def optimize(module, target_machine, custom=False):
+        if custom:
+            pm_builder = binding.create_pass_manager_builder()
+            pm_builder.opt_level = 3
+            pm_builder.loop_vectorize = True
+            pm_builder.slp_vectorize = True
+            pm_builder.fast_math = True  # Enable fast math optimizations
+            pm = binding.create_module_pass_manager()
+            pm_builder.populate(pm)
+            pm.run(module)
+        else:
+            pb = binding.PassBuilder(
+                target_machine,
+                binding.PipelineTuningOptions(speed_level=3, size_level=0),
+            )
+            pm = pb.getModulePassManager()
+            pm.run(module, pb)
 
     def fwd_fma(self, builder, X, X_idx, O, O_idx, v):
         # __m256 x = _mm256_loadu_ps(X + (idx * B + j));
@@ -1201,6 +1222,7 @@ class LinearJIT:
 
         llvm_ir = str(self.module)
         mod = binding.parse_assembly(llvm_ir)
+
         LinearJIT.optimize(mod, self.target_machine)
 
         self.engine.add_module(mod)
@@ -1515,7 +1537,38 @@ class LinearJIT:
     @staticmethod
     @njit(parallel=True, nogil=True)
     def _call_fwd(
-        is_tiled,
+        fn_fwd,
+        B,
+        M,
+        N,
+        W_nnz,
+        X,
+        W_idx_N,
+        W_idx_M,
+        W_val,
+        output,
+        loop_size,
+        chunk_size,
+    ):
+        lim = loop_size // chunk_size
+        for i in prange(lim):
+            fn_fwd(
+                i * chunk_size,
+                (i + 1) * chunk_size,
+                B,
+                M,
+                N,
+                W_nnz,
+                address_as_float_pointer(X),
+                address_as_int_pointer(W_idx_N),
+                address_as_int_pointer(W_idx_M),
+                address_as_float_pointer(W_val),
+                address_as_float_pointer(output),
+            )
+
+    @staticmethod
+    @njit(parallel=True, nogil=True)
+    def _call_fwd_tiled(
         W_reg_offset,
         fn_fwd,
         B,
@@ -1532,9 +1585,6 @@ class LinearJIT:
     ):
         lim = loop_size // chunk_size
         for i in prange(lim):
-            w_offset = None
-            if is_tiled:
-                w_offset = W_reg_offset[i * chunk_size]
             fn_fwd(
                 i * chunk_size,
                 (i + 1) * chunk_size,
@@ -1547,16 +1597,14 @@ class LinearJIT:
                 address_as_int_pointer(W_idx_M),
                 address_as_float_pointer(W_val),
                 address_as_float_pointer(output),
-                w_offset,
+                W_reg_offset[i * chunk_size],
             )
 
     def call_forward(
-        self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output, chunk_size=16
+        self, B, M, N, W_nnz, X, W_idx_N, W_idx_M, W_val, output, chunk_size=1
     ):
-        start = time.time()
         if not self.fn_fwd:
             self._jit_forward()
-        print("Jit time (approx):", time.time() - start)
 
         if self.options.unrolled_scalar:
             loop_size = B
@@ -1567,8 +1615,6 @@ class LinearJIT:
             loop_size = N
 
         args = [
-            self.options.reg_tiling,
-            self.W_reg_offset,
             self.fn_fwd,
             B,
             M,
@@ -1580,13 +1626,19 @@ class LinearJIT:
             W_val.data_ptr(),
             output.data_ptr(),
         ]
-        start = time.time()
-        LinearJIT._call_fwd(
-            *args,
-            loop_size,
-            min(loop_size, chunk_size if self.options.parallel else loop_size),
-        )
-        print("Jit FWD time (approx):", time.time() - start)
+        if self.options.reg_tiling:
+            LinearJIT._call_fwd_tiled(
+                self.W_reg_offset,
+                *args,
+                loop_size,
+                min(loop_size, chunk_size if self.options.parallel else loop_size),
+            )
+        else:
+            LinearJIT._call_fwd(
+                *args,
+                loop_size,
+                min(loop_size, chunk_size if self.options.parallel else loop_size),
+            )
 
     @staticmethod
     @njit(parallel=True, nogil=True)

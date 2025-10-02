@@ -46,7 +46,10 @@ class SparseLinearFunction(torch.autograd.Function):
             )
 
         ctx.jit = jit
-        ctx.save_for_backward(W_val, bias)
+        if hasattr(ctx, 'bench'):
+            ctx.saved_tensors = W_val, bias
+        else:
+            ctx.save_for_backward(W_val, bias)
         if jit and jit.options.reg_tiling:
             ctx.svd = (input_flat, jit_reg_idx[0], jit_reg_idx[1], jit_reg_idx[2])
         else:
