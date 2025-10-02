@@ -65,7 +65,7 @@ Notice that you need to provide the `input_shape` to this method, which is easil
 In the `examples` folder, you can find multiple python scripts, which will help you get started with *SparseProp*. In order to get persistent timings, we refer you to [this article](https://easyperf.net/blog/2019/08/02/Perf-measurement-environment-on-Linux). You can use your favorite command line tool in case you want to limit the number of CPU cores on which the code executes, e.g., `taskset` or `numactl`. Refer to the "Set cpu affinity" section in the same article.
 
 #### Correctness check
-The files `correctness_linear.py` and `correctness_conv2d.py` will compare the output of the *SparseLinear* and *SparseConv2d* modules with PyTorch's *Linear* and *Conv2d*, respectively. You can tweak the parameters in the scripts to check the correctness in different cases.
+The files `correctness_linear.py` and `correctness_conv2d.py` will compare the output of the *SparseLinear* and *SparseConv2d* modules with PyTorch's *Linear* and *Conv2d*, respectively. You can tweak the parameters in the scripts to check the correctness in different cases. Given the right parameters, `correctness_linear.py` will also compare correctness against the SparseJIT version.
 
 #### Layer-wise performance comparison
 The files `compare_linear.py` and `compare_conv2d.py` will compare the running time of the *SparseLinear* and *SparseConv2d* modules with PyTorch's *Linear* and *Conv2d*, respectively. You will find the results in the `plots` directory. Again, feel free to tweak the parameters in the scripts to compare the runtime in different cases.
@@ -96,6 +96,9 @@ In addition to the loss and accuracy metrics, this script also reports the time 
 - `avg_end_to_end_minibatch`: the average time spent processing a minibatch. This includes forward pass, backward pass, loss calculation, optimization step, etc. Note that loading the data into memory is not included.
 - `avg_module_forward_sum`: the average time spent in the forward function of the modules *torch.nn.Linear*, *torch.nn.Conv2d*, *SparseLinear*, and *SparseConv2d*.
 - `avg_module_backward_sum`: the average time spent in the backward function of the modules *torch.nn.Linear*, *torch.nn.Conv2d*, *SparseLinear*, and *SparseConv2d*.
+
+## Benchmarking SparseJIT
+`benchmark_all.py` Provides several options to benchmark the JIT version of SparseProp against the AOT version. Different parameters can be explored to customize the benchmarks.
 
 ## Todo
 1. Include outputs of the example scripts in the README.
